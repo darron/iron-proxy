@@ -29,7 +29,9 @@ import (
 	delegatedidentityv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/agent/delegatedidentity/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
 
 	"github.com/ironsh/iron-proxy/internal/hostmatch"
@@ -41,6 +43,7 @@ const (
 	defaultHeader       = "X-Sbx-Identity"
 	defaultPodCacheTTL  = 2 * time.Second
 	defaultFetchTimeout = 5 * time.Second
+	relayPollInterval   = 500 * time.Millisecond
 )
 
 func init() {
@@ -66,6 +69,10 @@ type relayConfig struct {
 	IDPattern      string `yaml:"id_pattern"`
 	SelectorType   string `yaml:"selector_type"`
 	SelectorPrefix string `yaml:"selector_prefix"`
+	// Wait bounds how long a relayed request waits for a newly created
+	// workload's entry to reach the agent (SPIRE answers PermissionDenied
+	// until it does). Zero means no wait; at most 15s.
+	Wait time.Duration `yaml:"wait,omitempty"`
 	// Source names the gateway pods allowed to relay: the connection's source
 	// IP must belong to exactly one Running pod matching it. This backs up
 	// the network policy that restricts who can reach the relay listener.
@@ -82,6 +89,7 @@ type relay struct {
 	selectorType   string
 	selectorPrefix string
 	source         PodResolver
+	wait           time.Duration
 }
 
 // routeConfig binds a set of destinations to one JWT audience, so a token
@@ -236,7 +244,10 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 		if len(c.Relay.Source.Namespaces) == 0 || c.Relay.Source.LabelSelector == "" {
 			return nil, fmt.Errorf("%s: relay.source needs namespaces and a label_selector naming the gateway pods", name)
 		}
-		rl = &relay{re: re, selectorType: c.Relay.SelectorType, selectorPrefix: c.Relay.SelectorPrefix}
+		if c.Relay.Wait < 0 || c.Relay.Wait > 15*time.Second {
+			return nil, fmt.Errorf("%s: relay.wait must be between 0 and 15s", name)
+		}
+		rl = &relay{re: re, selectorType: c.Relay.SelectorType, selectorPrefix: c.Relay.SelectorPrefix, wait: c.Relay.Wait}
 	}
 	return &Transform{
 		routes:      routes,
@@ -347,7 +358,27 @@ func (t *Transform) relayIdentity(ctx context.Context, tctx *transform.Transform
 		return t.unidentified(tctx, "relay_peer_mismatch")
 	}
 	sel := &types.Selector{Type: t.relay.selectorType, Value: t.relay.selectorPrefix + m[1]}
-	svid, err := t.svidFor(ctx, "relay:"+sel.Type+":"+sel.Value, sel, audience)
+	// A just-created workload's entry may not have reached the agent yet, so
+	// with relay.wait set, poll while SPIRE says the identity is not issued.
+	// One overall deadline bounds the first fetch, every retry RPC and every
+	// sleep, so the request never waits longer than relay.wait.
+	fctx := ctx
+	if t.relay.wait > 0 {
+		var cancel context.CancelFunc
+		fctx, cancel = context.WithTimeout(ctx, t.relay.wait)
+		defer cancel()
+	}
+	subject := "relay:" + sel.Type + ":" + sel.Value
+	svid, err := t.svidFor(fctx, subject, sel, audience)
+	for t.relay.wait > 0 && err != nil && status.Code(err) == codes.PermissionDenied && fctx.Err() == nil {
+		timer := time.NewTimer(relayPollInterval)
+		select {
+		case <-fctx.Done():
+			timer.Stop()
+		case <-timer.C:
+			svid, err = t.svidFor(fctx, subject, sel, audience)
+		}
+	}
 	if err != nil {
 		t.logger.Warn("spiffe_jwt_svid: no svid for relayed peer", slog.String("peer", peer), slog.String("error", err.Error()))
 		return t.unidentified(tctx, "svid_unavailable")
