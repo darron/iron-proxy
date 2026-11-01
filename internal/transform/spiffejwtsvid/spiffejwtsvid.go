@@ -176,7 +176,9 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 		tctx.Annotate("stripped", []string{"header:" + t.header})
 	}
 
-	if !hostmatch.MatchAnyRule(t.rules, req) {
+	// A CONNECT only opens a tunnel; each request inside it passes through
+	// this transform again and carries the identity there.
+	if req.Method == http.MethodConnect || !hostmatch.MatchAnyRule(t.rules, req) {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 	if tctx.Mode != transform.ModeMITM {
