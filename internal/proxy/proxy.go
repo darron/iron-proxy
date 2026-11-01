@@ -42,6 +42,9 @@ type Proxy struct {
 	tunnelAddr           string
 	tunnelListener       net.Listener
 	tunnelDone           chan struct{}
+	relayAddr            string
+	relayTLV             byte
+	relayListener        net.Listener
 	certCache            *certcache.Cache
 	pipeline             *transform.PipelineHolder
 	transport            *http.Transport
@@ -71,13 +74,17 @@ type Options struct {
 	HTTPAddr   string
 	HTTPSAddr  string
 	TunnelAddr string
-	TLSMode    string
-	CertCache  *certcache.Cache // required when TLSMode == config.TLSModeMITM
-	Pipeline   *transform.PipelineHolder
-	Resolver   *net.Resolver
-	Guard      *dnsguard.Guard   // nil is treated as an empty (no-op) guard
-	MCPPolicy  *mcp.PolicyHolder // optional MCP-aware policy interceptor; nil disables MCP handling
-	MCPGateway *mcpgateway.Holder
+	// RelayAddr, when set, starts the trusted relay listener (PROXY v2
+	// required; RelayPeerTLV carries the gateway-asserted peer identity).
+	RelayAddr    string
+	RelayPeerTLV byte
+	TLSMode      string
+	CertCache    *certcache.Cache // required when TLSMode == config.TLSModeMITM
+	Pipeline     *transform.PipelineHolder
+	Resolver     *net.Resolver
+	Guard        *dnsguard.Guard   // nil is treated as an empty (no-op) guard
+	MCPPolicy    *mcp.PolicyHolder // optional MCP-aware policy interceptor; nil disables MCP handling
+	MCPGateway   *mcpgateway.Holder
 	// ResponseRetryHandler may add headers and replay the exact transformed
 	// request once after selected upstream response statuses.
 	ResponseRetryHandler *responseretry.Handler
@@ -114,6 +121,8 @@ func New(opts Options) *Proxy {
 		httpsAddr:            opts.HTTPSAddr,
 		tlsMode:              opts.TLSMode,
 		tunnelAddr:           opts.TunnelAddr,
+		relayAddr:            opts.RelayAddr,
+		relayTLV:             opts.RelayPeerTLV,
 		tunnelDone:           make(chan struct{}),
 		certCache:            opts.CertCache,
 		pipeline:             opts.Pipeline,
@@ -152,7 +161,10 @@ func New(opts Options) *Proxy {
 func (p *Proxy) ListenAndServe() error {
 	n := 2
 	if p.tunnelAddr != "" {
-		n = 3
+		n++
+	}
+	if p.relayAddr != "" {
+		n++
 	}
 	errc := make(chan error, n)
 
@@ -177,6 +189,11 @@ func (p *Proxy) ListenAndServe() error {
 	if p.tunnelAddr != "" {
 		go func() {
 			errc <- fmt.Errorf("tunnel: %w", p.listenTunnel())
+		}()
+	}
+	if p.relayAddr != "" {
+		go func() {
+			errc <- fmt.Errorf("relay: %w", p.listenRelay())
 		}()
 	}
 
@@ -240,6 +257,9 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	close(p.tunnelDone)
 	if p.tunnelListener != nil {
 		p.tunnelListener.Close()
+	}
+	if p.relayListener != nil {
+		p.relayListener.Close()
 	}
 
 	if errHTTP != nil {

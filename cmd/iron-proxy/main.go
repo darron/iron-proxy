@@ -234,6 +234,8 @@ func main() {
 		HTTPAddr:                      cfg.Proxy.HTTPListen,
 		HTTPSAddr:                     cfg.Proxy.HTTPSListen,
 		TunnelAddr:                    cfg.Proxy.TunnelListen,
+		RelayAddr:                     cfg.Proxy.RelayListen,
+		RelayPeerTLV:                  relayPeerTLV(cfg.Proxy.RelayPeerTLV),
 		TLSMode:                       cfg.TLS.Mode,
 		CertCache:                     certCache,
 		Pipeline:                      holder,
@@ -296,6 +298,9 @@ func main() {
 	}
 	if cfg.Proxy.TunnelListen != "" {
 		startAttrs = append(startAttrs, slog.String("tunnel_listen", cfg.Proxy.TunnelListen))
+	}
+	if cfg.Proxy.RelayListen != "" {
+		startAttrs = append(startAttrs, slog.String("relay_listen", cfg.Proxy.RelayListen))
 	}
 	logger.Info("iron-proxy starting", startAttrs...)
 	if pipeline := holder.Load(); !pipeline.Empty() {
@@ -795,4 +800,13 @@ func splitCommaSeparated(value string) []string {
 		}
 	}
 	return values
+}
+
+// relayPeerTLV returns the configured relay identity TLV type, defaulting to
+// 0xE0 (the first of the PROXY v2 custom range). Validate bounds it to a byte.
+func relayPeerTLV(v int) byte {
+	if v == 0 {
+		return 0xE0
+	}
+	return byte(v)
 }

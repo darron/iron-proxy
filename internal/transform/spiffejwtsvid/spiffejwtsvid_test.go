@@ -478,6 +478,128 @@ func TestCachePrunesExpiredEntries(t *testing.T) {
 	f.byUID["uid-a"] = []SVID{{Token: "tok-a2", SPIFFEID: "spiffe://sbx.interval.internal/sandbox/kata/a", IssuedAt: clock, ExpiresAt: clock.Add(5 * time.Minute)}}
 	run(t, tr, transform.ModeMITM, request("executor.mcp.local", "10.0.0.1:1", nil))
 	require.Len(t, tr.cache, 1)
-	_, ok := tr.cache[cacheKey{"uid-a", "executor"}]
+	_, ok := tr.cache[cacheKey{"pod:uid-a", "executor"}]
 	require.True(t, ok)
+}
+
+type relayFetcher struct {
+	fakeFetcher
+	bySel map[string][]SVID // "type:value" -> svids
+}
+
+func (f *relayFetcher) FetchJWTSVIDs(ctx context.Context, aud string, sel []*types.Selector) ([]SVID, error) {
+	if len(sel) == 1 && sel[0].Type == "sbx" {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.calls++
+		f.lastAud = aud
+		s, ok := f.bySel[sel[0].Type+":"+sel[0].Value]
+		if !ok {
+			return nil, errors.New("PermissionDenied: no identity issued")
+		}
+		return s, nil
+	}
+	return f.fakeFetcher.FetchJWTSVIDs(ctx, aud, sel)
+}
+
+const axPeer = "spiffe://substrate-actor.local/worker-for-actor/ax-lab/sbx-abc123"
+
+func newRelayTransform(t *testing.T) (*Transform, *relayFetcher) {
+	t.Helper()
+	pods, base := setup()
+	f := &relayFetcher{fakeFetcher: fakeFetcher{byUID: base.byUID}, bySel: map[string][]SVID{
+		"sbx:ax-actor:sbx-abc123": {svid("spiffe://sbx.interval.internal/sandbox/ax/sbx-abc123/i/x", "tok-ax")},
+	}}
+	tr, err := newFromConfig(config{
+		TrustDomain: "sbx.interval.internal",
+		IDPrefix:    "/sandbox/",
+		Routes:      []routeConfig{{Audience: "model-router", Rules: []hostmatch.RuleConfig{{Host: "router.local"}}}},
+		Relay: &relayConfig{
+			IDPattern:      `^spiffe://substrate-actor\.local/worker-for-actor/ax-lab/([^/]+)$`,
+			SelectorType:   "sbx",
+			SelectorPrefix: "ax-actor:",
+		},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), pods, f)
+	require.NoError(t, err)
+	tr.now = func() time.Time { return t0.Add(time.Minute) }
+	return tr, f
+}
+
+func runCtx(t *testing.T, tr *Transform, ctx context.Context, r *http.Request) (transform.TransformAction, map[string]any) {
+	t.Helper()
+	tctx := &transform.TransformContext{Mode: transform.ModeMITM}
+	res, err := tr.TransformRequest(ctx, tctx, r)
+	require.NoError(t, err)
+	return res.Action, tctx.DrainAnnotations()
+}
+
+func TestRelayedPeerGetsItsOwnIdentity(t *testing.T) {
+	tr, f := newRelayTransform(t)
+	// The relay source IP is the gateway's and maps to a Kata pod in the
+	// fakes: the relay path must ignore it and use the asserted peer.
+	r := request("router.local", "10.0.0.1:1", http.Header{defaultHeader: {"Bearer forged"}})
+	act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), axPeer), r)
+	require.Equal(t, transform.ActionContinue, act)
+	require.Equal(t, []string{"Bearer tok-ax"}, r.Header.Values(defaultHeader))
+	require.Equal(t, "spiffe://sbx.interval.internal/sandbox/ax/sbx-abc123/i/x", ann["spiffe_id"])
+	require.Equal(t, axPeer, ann["relay_peer"])
+	require.Nil(t, ann["pod_uid"])
+	require.Equal(t, "model-router", f.lastAud)
+}
+
+func TestRelayedPeerFailsClosed(t *testing.T) {
+	cases := []struct {
+		name   string
+		peer   string
+		reason string
+	}{
+		{"no identity tlv", "", "relay_peer_mismatch"},
+		{"other atespace", "spiffe://substrate-actor.local/worker-for-actor/other/sbx-abc123", "relay_peer_mismatch"},
+		{"suffix smuggling", axPeer + "/extra", "relay_peer_mismatch"},
+		{"unknown actor", "spiffe://substrate-actor.local/worker-for-actor/ax-lab/sbx-nope", "svid_unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr, _ := newRelayTransform(t)
+			r := request("router.local", "10.0.0.1:1", nil)
+			act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), tc.peer), r)
+			require.Equal(t, transform.ActionReject, act)
+			require.Equal(t, tc.reason, ann["rejected"])
+			require.Empty(t, r.Header.Get(defaultHeader))
+		})
+	}
+}
+
+func TestRelayWithoutConfigNeverFallsBackToSourceIP(t *testing.T) {
+	pods, f := setup()
+	tr := newTestTransform(t, pods, f) // no relay config
+	r := request("executor.mcp.local", "10.0.0.1:1", nil)
+	act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), axPeer), r)
+	require.Equal(t, transform.ActionReject, act)
+	require.Equal(t, "relay_not_configured", ann["rejected"])
+	require.Equal(t, 0, f.calls)
+}
+
+func TestRelayConfigValidation(t *testing.T) {
+	base := config{TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/", Routes: []routeConfig{{Audience: "a", Rules: []hostmatch.RuleConfig{{Host: "x"}}}}}
+	cases := []struct {
+		name  string
+		relay relayConfig
+	}{
+		{"unanchored", relayConfig{IDPattern: `spiffe://x/(.+)`, SelectorType: "sbx"}},
+		{"no capture", relayConfig{IDPattern: `^spiffe://x/.+$`, SelectorType: "sbx"}},
+		{"two captures", relayConfig{IDPattern: `^spiffe://(x)/(.+)$`, SelectorType: "sbx"}},
+		{"no selector type", relayConfig{IDPattern: `^spiffe://x/(.+)$`}},
+		{"bad regex", relayConfig{IDPattern: `^spiffe://x/((.+)$`, SelectorType: "sbx"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pods, f := setup()
+			c := base
+			rc := tc.relay
+			c.Relay = &rc
+			_, err := newFromConfig(c, slog.Default(), pods, f)
+			require.Error(t, err)
+		})
+	}
 }
