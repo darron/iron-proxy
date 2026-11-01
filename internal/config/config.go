@@ -97,9 +97,15 @@ type DNSRecord struct {
 
 // Proxy configures the HTTP/HTTPS listener addresses.
 type Proxy struct {
-	HTTPListen           string `yaml:"http_listen"`
-	HTTPSListen          string `yaml:"https_listen"`
-	TunnelListen         string `yaml:"tunnel_listen"`
+	HTTPListen   string `yaml:"http_listen"`
+	HTTPSListen  string `yaml:"https_listen"`
+	TunnelListen string `yaml:"tunnel_listen"`
+	// RelayListen starts a listener for a trusted gateway that relays
+	// workload connections behind a PROXY protocol v2 header. RelayPeerTLV
+	// (default 0xE0) is the TLV type carrying the identity the gateway
+	// verified. Restrict who can reach it at the network layer.
+	RelayListen          string `yaml:"relay_listen"`
+	RelayPeerTLV         int    `yaml:"relay_peer_tlv"`
 	MaxRequestBodyBytes  int64  `yaml:"max_request_body_bytes"`
 	MaxResponseBodyBytes int64  `yaml:"max_response_body_bytes"`
 	// UpstreamResponseHeaderTimeout caps how long the proxy waits for an
@@ -286,6 +292,12 @@ func applyDefaults(cfg *Config) {
 func Validate(cfg *Config) error {
 	if cfg.DNS.IsEnabled() && cfg.DNS.ProxyIP == "" {
 		return fmt.Errorf("dns.proxy_ip is required")
+	}
+	if cfg.Proxy.RelayPeerTLV < 0 || cfg.Proxy.RelayPeerTLV > 255 {
+		return fmt.Errorf("proxy.relay_peer_tlv must be a TLV type between 0 and 255")
+	}
+	if cfg.Proxy.RelayListen != "" && cfg.Proxy.RelayListen == cfg.Proxy.TunnelListen {
+		return fmt.Errorf("proxy.relay_listen must differ from proxy.tunnel_listen")
 	}
 
 	switch cfg.TLS.Mode {

@@ -415,6 +415,14 @@ func serveOneHTTPConn(conn net.Conn, handler http.Handler) error {
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       10 * time.Second,
+		// Requests on a relay-listener connection (including those inside
+		// its CONNECT tunnels) carry the gateway-asserted peer identity.
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if peer, ok := relayPeerOf(c); ok {
+				return transform.WithRelayPeer(ctx, peer)
+			}
+			return ctx
+		},
 		ConnState: func(_ net.Conn, state http.ConnState) {
 			if state == http.StateHijacked {
 				hijacked.Store(true)

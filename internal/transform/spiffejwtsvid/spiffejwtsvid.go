@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +55,23 @@ type config struct {
 	Mode        string        `yaml:"mode,omitempty"`
 	Kubernetes  kubeConfig    `yaml:"kubernetes"`
 	Routes      []routeConfig `yaml:"routes"`
+	Relay       *relayConfig  `yaml:"relay,omitempty"`
+}
+
+// relayConfig handles requests that arrived on iron-proxy's trusted relay
+// listener, where a gateway (not the source IP) asserts who the workload is.
+// IDPattern must match the whole asserted identity and capture exactly one
+// group; the SVID is fetched for selector SelectorType:SelectorPrefix+group.
+type relayConfig struct {
+	IDPattern      string `yaml:"id_pattern"`
+	SelectorType   string `yaml:"selector_type"`
+	SelectorPrefix string `yaml:"selector_prefix"`
+}
+
+type relay struct {
+	re             *regexp.Regexp
+	selectorType   string
+	selectorPrefix string
 }
 
 // routeConfig binds a set of destinations to one JWT audience, so a token
@@ -107,6 +125,7 @@ type Transform struct {
 	trustDomain string
 	idPrefix    string
 	observe     bool
+	relay       *relay
 	pods        PodResolver
 	fetcher     SVIDFetcher
 	now         func() time.Time
@@ -175,12 +194,30 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 	default:
 		return nil, fmt.Errorf("%s: \"mode\" must be \"enforce\" or \"observe\"", name)
 	}
+	var rl *relay
+	if c.Relay != nil {
+		if !strings.HasPrefix(c.Relay.IDPattern, "^") || !strings.HasSuffix(c.Relay.IDPattern, "$") {
+			return nil, fmt.Errorf("%s: relay.id_pattern must be anchored with ^ and $", name)
+		}
+		re, err := regexp.Compile(c.Relay.IDPattern)
+		if err != nil {
+			return nil, fmt.Errorf("%s: relay.id_pattern: %w", name, err)
+		}
+		if re.NumSubexp() != 1 {
+			return nil, fmt.Errorf("%s: relay.id_pattern must capture exactly one group", name)
+		}
+		if c.Relay.SelectorType == "" || strings.Contains(c.Relay.SelectorType, ":") {
+			return nil, fmt.Errorf("%s: relay.selector_type is required and must not contain ':'", name)
+		}
+		rl = &relay{re: re, selectorType: c.Relay.SelectorType, selectorPrefix: c.Relay.SelectorPrefix}
+	}
 	return &Transform{
 		routes:      routes,
 		header:      header,
 		trustDomain: c.TrustDomain,
 		idPrefix:    c.IDPrefix,
 		observe:     observe,
+		relay:       rl,
 		pods:        pods,
 		fetcher:     fetcher,
 		now:         time.Now,
@@ -224,6 +261,11 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 	if tctx.Mode != transform.ModeMITM {
 		return t.unidentified(tctx, "mitm_required")
 	}
+	// A request relayed by a trusted gateway is identified by what that
+	// gateway asserted, never by the source IP (the gateway's own address).
+	if peer, ok := transform.RelayPeer(ctx); ok {
+		return t.relayIdentity(ctx, tctx, req, audience, peer)
+	}
 
 	ip, err := sourceIP(req.RemoteAddr)
 	if err != nil {
@@ -240,7 +282,7 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 		return t.unidentified(tctx, "pod_lookup_failed")
 	}
 
-	svid, err := t.svidFor(ctx, pod.UID, audience)
+	svid, err := t.svidFor(ctx, "pod:"+pod.UID, &types.Selector{Type: "k8s", Value: "pod-uid:" + pod.UID}, audience)
 	if err != nil {
 		t.logger.Warn("spiffe_jwt_svid: no svid", slog.String("pod_uid", pod.UID), slog.String("error", err.Error()))
 		return t.unidentified(tctx, "svid_unavailable")
@@ -250,6 +292,28 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 	tctx.Annotate("spiffe_id", svid.SPIFFEID)
 	tctx.Annotate("pod", pod.Namespace+"/"+pod.Name)
 	tctx.Annotate("pod_uid", pod.UID)
+	tctx.Annotate("audience", audience)
+	tctx.Annotate("injected", []string{"header:" + t.header})
+	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+func (t *Transform) relayIdentity(ctx context.Context, tctx *transform.TransformContext, req *http.Request, audience, peer string) (*transform.TransformResult, error) {
+	if t.relay == nil {
+		return t.unidentified(tctx, "relay_not_configured")
+	}
+	m := t.relay.re.FindStringSubmatch(peer)
+	if m == nil || m[1] == "" {
+		return t.unidentified(tctx, "relay_peer_mismatch")
+	}
+	sel := &types.Selector{Type: t.relay.selectorType, Value: t.relay.selectorPrefix + m[1]}
+	svid, err := t.svidFor(ctx, "relay:"+sel.Type+":"+sel.Value, sel, audience)
+	if err != nil {
+		t.logger.Warn("spiffe_jwt_svid: no svid for relayed peer", slog.String("peer", peer), slog.String("error", err.Error()))
+		return t.unidentified(tctx, "svid_unavailable")
+	}
+	req.Header.Set(t.header, "Bearer "+svid.Token)
+	tctx.Annotate("spiffe_id", svid.SPIFFEID)
+	tctx.Annotate("relay_peer", peer)
 	tctx.Annotate("audience", audience)
 	tctx.Annotate("injected", []string{"header:" + t.header})
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
@@ -269,15 +333,17 @@ func (t *Transform) audienceFor(req *http.Request) (string, bool) {
 	return "", false
 }
 
-type cacheKey struct{ podUID, audience string }
+// cacheKey identifies a cached SVID: the workload subject ("pod:<uid>" or
+// "relay:<selector>") and the audience it was minted for.
+type cacheKey struct{ subject, audience string }
 
 // svidFor returns a cached SVID until half its lifetime has passed, then
 // fetches a fresh one. A fetch failure evicts the cache entry, so deleting
 // the registration entry stops injection at the next refresh at the latest.
 // Expired entries (for example of deleted pods) are pruned on every store.
-func (t *Transform) svidFor(ctx context.Context, podUID, audience string) (SVID, error) {
+func (t *Transform) svidFor(ctx context.Context, subject string, selector *types.Selector, audience string) (SVID, error) {
 	now := t.now()
-	key := cacheKey{podUID, audience}
+	key := cacheKey{subject, audience}
 	t.mu.Lock()
 	cached, ok := t.cache[key]
 	t.mu.Unlock()
@@ -287,7 +353,7 @@ func (t *Transform) svidFor(ctx context.Context, podUID, audience string) (SVID,
 
 	fctx, cancel := context.WithTimeout(ctx, defaultFetchTimeout)
 	defer cancel()
-	svids, err := t.fetcher.FetchJWTSVIDs(fctx, audience, []*types.Selector{{Type: "k8s", Value: "pod-uid:" + podUID}})
+	svids, err := t.fetcher.FetchJWTSVIDs(fctx, audience, []*types.Selector{selector})
 	if err == nil {
 		var svid SVID
 		svid, err = t.pickSVID(svids, now)
