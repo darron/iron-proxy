@@ -65,10 +65,12 @@ func svid(id, tok string) SVID {
 func newTestTransform(t *testing.T, pods PodResolver, f SVIDFetcher) *Transform {
 	t.Helper()
 	tr, err := newFromConfig(config{
-		Audience:    "executor",
 		TrustDomain: "sbx.interval.internal",
 		IDPrefix:    "/sandbox/",
-		Rules:       []hostmatch.RuleConfig{{Host: "executor.mcp.local"}},
+		Routes: []routeConfig{
+			{Audience: "executor", Rules: []hostmatch.RuleConfig{{Host: "executor.mcp.local"}}},
+			{Audience: "model-router", Rules: []hostmatch.RuleConfig{{Host: "router.local"}}},
+		},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)), pods, f)
 	require.NoError(t, err)
 	tr.now = func() time.Time { return t0.Add(time.Minute) }
@@ -232,16 +234,17 @@ func TestConnectPassesWithoutIdentity(t *testing.T) {
 }
 
 func TestConfigValidation(t *testing.T) {
-	base := config{Audience: "a", TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/", Rules: []hostmatch.RuleConfig{{Host: "x"}}}
+	base := config{TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/", Routes: []routeConfig{{Audience: "a", Rules: []hostmatch.RuleConfig{{Host: "x"}}}}}
 	cases := []struct {
 		name string
 		mut  func(c *config)
 	}{
-		{"no audience", func(c *config) { c.Audience = "" }},
+		{"no audience", func(c *config) { c.Routes = []routeConfig{{Rules: []hostmatch.RuleConfig{{Host: "x"}}}} }},
+		{"route without rules", func(c *config) { c.Routes = []routeConfig{{Audience: "a"}} }},
 		{"trust domain with scheme", func(c *config) { c.TrustDomain = "spiffe://sbx" }},
 		{"root prefix", func(c *config) { c.IDPrefix = "/" }},
 		{"relative prefix", func(c *config) { c.IDPrefix = "sandbox" }},
-		{"no rules", func(c *config) { c.Rules = nil }},
+		{"no routes", func(c *config) { c.Routes = nil }},
 		{"forbidden header", func(c *config) { c.Header = "Proxy-Authorization" }},
 	}
 	for _, tc := range cases {
@@ -426,7 +429,7 @@ func TestObserveModeNeverBlocks(t *testing.T) {
 
 func TestModeConfig(t *testing.T) {
 	pods, f := setup()
-	base := config{Audience: "a", TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/", Rules: []hostmatch.RuleConfig{{Host: "x"}}}
+	base := config{TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/", Routes: []routeConfig{{Audience: "a", Rules: []hostmatch.RuleConfig{{Host: "x"}}}}}
 	for _, mode := range []string{"", "enforce", "observe"} {
 		c := base
 		c.Mode = mode
@@ -438,4 +441,43 @@ func TestModeConfig(t *testing.T) {
 	c.Mode = "permissive"
 	_, err := newFromConfig(c, slog.Default(), pods, f)
 	require.Error(t, err)
+}
+
+func TestAudiencePerRoute(t *testing.T) {
+	pods, f := setup()
+	tr := newTestTransform(t, pods, f)
+
+	_, ann := run(t, tr, transform.ModeMITM, request("executor.mcp.local", "10.0.0.1:1", nil))
+	require.Equal(t, "executor", f.lastAud)
+	require.Equal(t, "executor", ann["audience"])
+
+	_, ann = run(t, tr, transform.ModeMITM, request("router.local", "10.0.0.1:1", nil))
+	require.Equal(t, "model-router", f.lastAud)
+	require.Equal(t, "model-router", ann["audience"])
+	require.Equal(t, 2, f.calls, "each audience needs its own token, never a shared cache entry")
+
+	// Unmatched hosts get no identity and no fetch.
+	r := request("example.com", "10.0.0.1:1", nil)
+	act, _ := run(t, tr, transform.ModeMITM, r)
+	require.Equal(t, transform.ActionContinue, act)
+	require.Empty(t, r.Header.Get(defaultHeader))
+	require.Equal(t, 2, f.calls)
+}
+
+func TestCachePrunesExpiredEntries(t *testing.T) {
+	pods, f := setup()
+	tr := newTestTransform(t, pods, f)
+	clock := t0.Add(time.Minute)
+	tr.now = func() time.Time { return clock }
+
+	run(t, tr, transform.ModeMITM, request("executor.mcp.local", "10.0.0.2:1", nil))
+	require.Len(t, tr.cache, 1)
+
+	// B's token expires; storing A's token prunes it.
+	clock = t0.Add(10 * time.Minute)
+	f.byUID["uid-a"] = []SVID{{Token: "tok-a2", SPIFFEID: "spiffe://sbx.interval.internal/sandbox/kata/a", IssuedAt: clock, ExpiresAt: clock.Add(5 * time.Minute)}}
+	run(t, tr, transform.ModeMITM, request("executor.mcp.local", "10.0.0.1:1", nil))
+	require.Len(t, tr.cache, 1)
+	_, ok := tr.cache[cacheKey{"uid-a", "executor"}]
+	require.True(t, ok)
 }
