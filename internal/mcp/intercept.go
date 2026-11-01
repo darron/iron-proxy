@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -52,12 +53,11 @@ func (p *Policy) EvaluateRequest(server *Server, req *http.Request, trace *Trace
 	// omitting or falsifying Content-Type. GET listeners and other shapes pass
 	// through; their responses are still wrapped if they arrive over
 	// text/event-stream so the listener stream is filtered.
-	if req.Method != http.MethodPost {
-		return nil, nil
-	}
-
 	bb, ok := req.Body.(*transform.BufferedBody)
 	if !ok {
+		if req.Method != http.MethodPost && (req.Body == nil || req.Body == http.NoBody) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("mcp: expected *transform.BufferedBody, got %T", req.Body)
 	}
 	body, err := io.ReadAll(bb)
@@ -65,6 +65,22 @@ func (p *Policy) EvaluateRequest(server *Server, req *http.Request, trace *Trace
 		return nil, fmt.Errorf("mcp: reading request body: %w", err)
 	}
 	bb.Reset()
+
+	// A non-POST request (GET listener, DELETE session end) never carries a
+	// JSON-RPC message, so it is not evaluated. It must then carry no body
+	// either: a server that acted on a body sent with another method would
+	// receive an unevaluated message with the gateway's credentials.
+	if req.Method != http.MethodPost {
+		if len(bytes.TrimSpace(body)) == 0 {
+			return nil, nil
+		}
+		trace.Append(Message{
+			Direction: DirectionRequest,
+			Decision:  DecisionDeny,
+			Reason:    ReasonBodyNotAllowed,
+		})
+		return p.policyErrorResponse(req, nil, false)
+	}
 
 	// If the upstream Content-Length exceeded the buffered body cap, the
 	// read returned a truncated body and we cannot reliably parse JSON-RPC.
@@ -79,10 +95,14 @@ func (p *Policy) EvaluateRequest(server *Server, req *http.Request, trace *Trace
 
 	msgs, isBatch, err := decodeJSONRPC(body)
 	if err != nil {
+		reason := ReasonMalformedJSONRPC
+		if errors.Is(err, errAmbiguousKeys) {
+			reason = ReasonAmbiguousKeys
+		}
 		trace.Append(Message{
 			Direction: DirectionRequest,
 			Decision:  DecisionDeny,
-			Reason:    ReasonMalformedJSONRPC,
+			Reason:    reason,
 		})
 		return p.policyErrorResponse(req, nil, isBatch)
 	}
