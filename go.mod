@@ -18,6 +18,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/pganalyze/pg_query_go/v6 v6.2.2
 	github.com/pkg/sftp v1.13.12
+	github.com/spiffe/spire-api-sdk v1.15.3
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
