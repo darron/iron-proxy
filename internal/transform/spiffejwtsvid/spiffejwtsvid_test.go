@@ -322,3 +322,16 @@ func TestKubePodResolver(t *testing.T) {
 }
 
 func writeFile(path, content string) error { return os.WriteFile(path, []byte(content), 0o600) }
+
+func TestConnectPassesWithoutIdentity(t *testing.T) {
+	pods, f := setup()
+	tr := newTestTransform(t, pods, f)
+	r := httptest.NewRequest(http.MethodConnect, "http://executor.mcp.local:80", nil)
+	r.Host = "executor.mcp.local:80"
+	r.RemoteAddr = "10.0.0.50:1" // unknown source: still not refused at CONNECT
+	r.Header.Set(defaultHeader, "Bearer forged")
+	act, _ := run(t, tr, transform.ModeSNIOnly, r)
+	if act != transform.ActionContinue || r.Header.Get(defaultHeader) != "" || f.calls != 0 {
+		t.Fatalf("CONNECT: action=%v header=%q calls=%d", act, r.Header.Get(defaultHeader), f.calls)
+	}
+}
