@@ -66,12 +66,22 @@ type relayConfig struct {
 	IDPattern      string `yaml:"id_pattern"`
 	SelectorType   string `yaml:"selector_type"`
 	SelectorPrefix string `yaml:"selector_prefix"`
+	// Source names the gateway pods allowed to relay: the connection's source
+	// IP must belong to exactly one Running pod matching it. This backs up
+	// the network policy that restricts who can reach the relay listener.
+	Source relaySourceConfig `yaml:"source"`
+}
+
+type relaySourceConfig struct {
+	Namespaces    []string `yaml:"namespaces"`
+	LabelSelector string   `yaml:"label_selector"`
 }
 
 type relay struct {
 	re             *regexp.Regexp
 	selectorType   string
 	selectorPrefix string
+	source         PodResolver
 }
 
 // routeConfig binds a set of destinations to one JWT audience, so a token
@@ -151,7 +161,21 @@ func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) 
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}
-	return newFromConfig(c, logger, pods, fetcher)
+	t, err := newFromConfig(c, logger, pods, fetcher)
+	if err != nil {
+		return nil, err
+	}
+	if t.relay != nil {
+		kc := c.Kubernetes
+		kc.Namespaces = c.Relay.Source.Namespaces
+		kc.LabelSelector = c.Relay.Source.LabelSelector
+		src, err := newKubePodResolver(kc)
+		if err != nil {
+			return nil, fmt.Errorf("%s: relay.source: %w", name, err)
+		}
+		t.relay.source = src
+	}
+	return t, nil
 }
 
 func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVIDFetcher) (*Transform, error) {
@@ -208,6 +232,9 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 		}
 		if c.Relay.SelectorType == "" || strings.Contains(c.Relay.SelectorType, ":") {
 			return nil, fmt.Errorf("%s: relay.selector_type is required and must not contain ':'", name)
+		}
+		if len(c.Relay.Source.Namespaces) == 0 || c.Relay.Source.LabelSelector == "" {
+			return nil, fmt.Errorf("%s: relay.source needs namespaces and a label_selector naming the gateway pods", name)
 		}
 		rl = &relay{re: re, selectorType: c.Relay.SelectorType, selectorPrefix: c.Relay.SelectorPrefix}
 	}
@@ -300,6 +327,20 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 func (t *Transform) relayIdentity(ctx context.Context, tctx *transform.TransformContext, req *http.Request, audience, peer string) (*transform.TransformResult, error) {
 	if t.relay == nil {
 		return t.unidentified(tctx, "relay_not_configured")
+	}
+	// The relaying connection itself must come from a configured gateway pod.
+	ip, err := sourceIP(req.RemoteAddr)
+	if err != nil {
+		return t.unidentified(tctx, "bad_remote_addr")
+	}
+	if t.relay.source == nil {
+		return t.unidentified(tctx, "relay_source_untrusted")
+	}
+	if _, err := t.relay.source.Resolve(ctx, ip); err != nil {
+		if !errors.Is(err, ErrNoPod) && !errors.Is(err, ErrAmbiguousPod) {
+			t.logger.Warn("spiffe_jwt_svid: relay source lookup failed", slog.String("error", err.Error()))
+		}
+		return t.unidentified(tctx, "relay_source_untrusted")
 	}
 	m := t.relay.re.FindStringSubmatch(peer)
 	if m == nil || m[1] == "" {

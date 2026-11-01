@@ -518,12 +518,16 @@ func newRelayTransform(t *testing.T) (*Transform, *relayFetcher) {
 			IDPattern:      `^spiffe://substrate-actor\.local/worker-for-actor/ax-lab/([^/]+)$`,
 			SelectorType:   "sbx",
 			SelectorPrefix: "ax-actor:",
+			Source:         relaySourceConfig{Namespaces: []string{"ate-system"}, LabelSelector: "app=atenet-egress"},
 		},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)), pods, f)
 	require.NoError(t, err)
 	tr.now = func() time.Time { return t0.Add(time.Minute) }
+	tr.relay.source = fakePods{gatewayIP: {Namespace: "ate-system", Name: "atenet-egress-x", UID: "gw"}}
 	return tr, f
 }
+
+const gatewayIP = "10.0.0.200"
 
 func runCtx(t *testing.T, tr *Transform, ctx context.Context, r *http.Request) (transform.TransformAction, map[string]any) {
 	t.Helper()
@@ -535,9 +539,9 @@ func runCtx(t *testing.T, tr *Transform, ctx context.Context, r *http.Request) (
 
 func TestRelayedPeerGetsItsOwnIdentity(t *testing.T) {
 	tr, f := newRelayTransform(t)
-	// The relay source IP is the gateway's and maps to a Kata pod in the
-	// fakes: the relay path must ignore it and use the asserted peer.
-	r := request("router.local", "10.0.0.1:1", http.Header{defaultHeader: {"Bearer forged"}})
+	// The relay path identifies the asserted peer, never the gateway's own
+	// source IP.
+	r := request("router.local", gatewayIP+":1", http.Header{defaultHeader: {"Bearer forged"}})
 	act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), axPeer), r)
 	require.Equal(t, transform.ActionContinue, act)
 	require.Equal(t, []string{"Bearer tok-ax"}, r.Header.Values(defaultHeader))
@@ -561,7 +565,7 @@ func TestRelayedPeerFailsClosed(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tr, _ := newRelayTransform(t)
-			r := request("router.local", "10.0.0.1:1", nil)
+			r := request("router.local", gatewayIP+":1", nil)
 			act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), tc.peer), r)
 			require.Equal(t, transform.ActionReject, act)
 			require.Equal(t, tc.reason, ann["rejected"])
@@ -581,16 +585,18 @@ func TestRelayWithoutConfigNeverFallsBackToSourceIP(t *testing.T) {
 }
 
 func TestRelayConfigValidation(t *testing.T) {
+	src := relaySourceConfig{Namespaces: []string{"ate-system"}, LabelSelector: "app=atenet-egress"}
 	base := config{TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/", Routes: []routeConfig{{Audience: "a", Rules: []hostmatch.RuleConfig{{Host: "x"}}}}}
 	cases := []struct {
 		name  string
 		relay relayConfig
 	}{
-		{"unanchored", relayConfig{IDPattern: `spiffe://x/(.+)`, SelectorType: "sbx"}},
-		{"no capture", relayConfig{IDPattern: `^spiffe://x/.+$`, SelectorType: "sbx"}},
-		{"two captures", relayConfig{IDPattern: `^spiffe://(x)/(.+)$`, SelectorType: "sbx"}},
+		{"unanchored", relayConfig{IDPattern: `spiffe://x/(.+)`, SelectorType: "sbx", Source: src}},
+		{"no capture", relayConfig{IDPattern: `^spiffe://x/.+$`, SelectorType: "sbx", Source: src}},
+		{"two captures", relayConfig{IDPattern: `^spiffe://(x)/(.+)$`, SelectorType: "sbx", Source: src}},
 		{"no selector type", relayConfig{IDPattern: `^spiffe://x/(.+)$`}},
-		{"bad regex", relayConfig{IDPattern: `^spiffe://x/((.+)$`, SelectorType: "sbx"}},
+		{"no source", relayConfig{IDPattern: `^spiffe://x/(.+)$`, SelectorType: "sbx"}},
+		{"bad regex", relayConfig{IDPattern: `^spiffe://x/((.+)$`, SelectorType: "sbx", Source: src}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -602,4 +608,16 @@ func TestRelayConfigValidation(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+func TestRelayFromUntrustedSourceIsRefused(t *testing.T) {
+	tr, f := newRelayTransform(t)
+	// A Kata guest (10.0.0.1) that somehow reached the relay listener and sent
+	// a PROXY header naming an AX actor gets nothing.
+	r := request("router.local", "10.0.0.1:1", nil)
+	act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), axPeer), r)
+	require.Equal(t, transform.ActionReject, act)
+	require.Equal(t, "relay_source_untrusted", ann["rejected"])
+	require.Empty(t, r.Header.Get(defaultHeader))
+	require.Equal(t, 0, f.calls)
 }
