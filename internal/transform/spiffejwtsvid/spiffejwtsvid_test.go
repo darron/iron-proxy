@@ -16,6 +16,8 @@ import (
 
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
@@ -485,6 +487,13 @@ func TestCachePrunesExpiredEntries(t *testing.T) {
 type relayFetcher struct {
 	fakeFetcher
 	bySel map[string][]SVID // "type:value" -> svids
+	// pending answers PermissionDenied for this many sbx fetches first (an
+	// entry still propagating to the agent).
+	pending int
+	// otherErr, when set, is returned for sbx fetches instead.
+	otherErr error
+	// stall blocks sbx fetches until their context ends.
+	stall bool
 }
 
 func (f *relayFetcher) FetchJWTSVIDs(ctx context.Context, aud string, sel []*types.Selector) ([]SVID, error) {
@@ -493,9 +502,22 @@ func (f *relayFetcher) FetchJWTSVIDs(ctx context.Context, aud string, sel []*typ
 		defer f.mu.Unlock()
 		f.calls++
 		f.lastAud = aud
+		if f.stall {
+			f.mu.Unlock()
+			<-ctx.Done()
+			f.mu.Lock()
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+		if f.otherErr != nil {
+			return nil, f.otherErr
+		}
+		if f.pending > 0 {
+			f.pending--
+			return nil, status.Error(codes.PermissionDenied, "no identity issued")
+		}
 		s, ok := f.bySel[sel[0].Type+":"+sel[0].Value]
 		if !ok {
-			return nil, errors.New("PermissionDenied: no identity issued")
+			return nil, status.Error(codes.PermissionDenied, "no identity issued")
 		}
 		return s, nil
 	}
@@ -620,4 +642,86 @@ func TestRelayFromUntrustedSourceIsRefused(t *testing.T) {
 	require.Equal(t, "relay_source_untrusted", ann["rejected"])
 	require.Empty(t, r.Header.Get(defaultHeader))
 	require.Equal(t, 0, f.calls)
+}
+
+func TestRelayWaitsForPropagatingEntry(t *testing.T) {
+	tr, f := newRelayTransform(t)
+	tr.relay.wait = 3 * time.Second
+	f.pending = 2 // entry reaches the agent on the third poll
+	r := request("router.local", gatewayIP+":1", nil)
+	start := time.Now()
+	act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), axPeer), r)
+	require.Equal(t, transform.ActionContinue, act)
+	require.Equal(t, "Bearer tok-ax", r.Header.Get(defaultHeader))
+	require.NotNil(t, ann["spiffe_id"])
+	require.Equal(t, 3, f.calls)
+	require.Less(t, time.Since(start), 3*time.Second)
+}
+
+func TestRelayWaitIsBoundedAndOnlyForNotIssued(t *testing.T) {
+	cases := []struct {
+		name      string
+		wait      time.Duration
+		pending   int
+		otherErr  error
+		wantCalls int
+	}{
+		{"no wait configured", 0, 100, nil, 1},
+		{"gives up after wait", 1200 * time.Millisecond, 100, nil, 3}, // polls at 0, 0.5 s, 1.0 s; no poll past the deadline
+		{"other errors never wait", 3 * time.Second, 0, status.Error(codes.Unavailable, "agent down"), 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr, f := newRelayTransform(t)
+			tr.relay.wait = tc.wait
+			f.pending = tc.pending
+			f.otherErr = tc.otherErr
+			r := request("router.local", gatewayIP+":1", nil)
+			act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), axPeer), r)
+			require.Equal(t, transform.ActionReject, act)
+			require.Equal(t, "svid_unavailable", ann["rejected"])
+			require.Equal(t, tc.wantCalls, f.calls)
+		})
+	}
+}
+
+func TestRelayWaitBoundsStalledRPC(t *testing.T) {
+	tr, f := newRelayTransform(t)
+	tr.relay.wait = 700 * time.Millisecond
+	f.stall = true
+	r := request("router.local", gatewayIP+":1", nil)
+	start := time.Now()
+	act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), axPeer), r)
+	require.Equal(t, transform.ActionReject, act)
+	require.Equal(t, "svid_unavailable", ann["rejected"])
+	require.Less(t, time.Since(start), 1500*time.Millisecond, "a stalled RPC must not outlast relay.wait")
+}
+
+func TestRelayWaitStopsOnClientCancel(t *testing.T) {
+	tr, f := newRelayTransform(t)
+	tr.relay.wait = 10 * time.Second
+	f.pending = 1000
+	ctx, cancel := context.WithTimeout(transform.WithRelayPeer(context.Background(), axPeer), 600*time.Millisecond)
+	defer cancel()
+	r := request("router.local", gatewayIP+":1", nil)
+	start := time.Now()
+	act, ann := runCtx(t, tr, ctx, r)
+	require.Equal(t, transform.ActionReject, act)
+	require.Equal(t, "svid_unavailable", ann["rejected"])
+	require.Less(t, time.Since(start), 2*time.Second)
+}
+
+func TestRelayMultipleSVIDsRefusedWithoutWaiting(t *testing.T) {
+	tr, f := newRelayTransform(t)
+	tr.relay.wait = 3 * time.Second
+	f.bySel["sbx:ax-actor:sbx-abc123"] = []SVID{
+		svid("spiffe://sbx.interval.internal/sandbox/ax/sbx-abc123/i/x", "t1"),
+		svid("spiffe://sbx.interval.internal/sandbox/ax/sbx-abc123/i/y", "t2"),
+	}
+	r := request("router.local", gatewayIP+":1", nil)
+	act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), axPeer), r)
+	require.Equal(t, transform.ActionReject, act)
+	require.Equal(t, "svid_unavailable", ann["rejected"])
+	require.Equal(t, 1, f.calls)
+	require.Empty(t, r.Header.Get(defaultHeader))
 }
