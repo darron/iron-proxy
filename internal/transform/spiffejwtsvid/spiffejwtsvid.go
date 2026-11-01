@@ -52,6 +52,7 @@ type config struct {
 	Header      string                 `yaml:"header,omitempty"`
 	TrustDomain string                 `yaml:"trust_domain"`
 	IDPrefix    string                 `yaml:"id_prefix"`
+	Mode        string                 `yaml:"mode,omitempty"`
 	Kubernetes  kubeConfig             `yaml:"kubernetes"`
 	Rules       []hostmatch.RuleConfig `yaml:"rules"`
 }
@@ -95,6 +96,7 @@ type Transform struct {
 	header      string
 	trustDomain string
 	idPrefix    string
+	observe     bool
 	pods        PodResolver
 	fetcher     SVIDFetcher
 	now         func() time.Time
@@ -148,12 +150,21 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 	case "host", "proxy-authorization", "cookie", "content-length", "transfer-encoding":
 		return nil, fmt.Errorf("%s: \"header\" %q is not allowed", name, header)
 	}
+	var observe bool
+	switch c.Mode {
+	case "", "enforce":
+	case "observe":
+		observe = true
+	default:
+		return nil, fmt.Errorf("%s: \"mode\" must be \"enforce\" or \"observe\"", name)
+	}
 	return &Transform{
 		rules:       rules,
 		audience:    c.Audience,
 		header:      header,
 		trustDomain: c.TrustDomain,
 		idPrefix:    c.IDPrefix,
+		observe:     observe,
 		pods:        pods,
 		fetcher:     fetcher,
 		now:         time.Now,
@@ -164,7 +175,16 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 
 func (t *Transform) Name() string { return name }
 
-func reject(tctx *transform.TransformContext, reason string) (*transform.TransformResult, error) {
+// unidentified handles a matching request that cannot carry an identity.
+// In enforce mode it is refused. In observe mode it continues without the
+// header (any client copy was already stripped), for rollouts where some
+// sources (for example traffic relayed by another lane's gateway) have no
+// pod identity yet.
+func (t *Transform) unidentified(tctx *transform.TransformContext, reason string) (*transform.TransformResult, error) {
+	if t.observe {
+		tctx.Annotate("unidentified", reason)
+		return &transform.TransformResult{Action: transform.ActionContinue}, nil
+	}
 	tctx.Annotate("rejected", reason)
 	return &transform.TransformResult{Action: transform.ActionReject}, nil
 }
@@ -182,28 +202,28 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 	if tctx.Mode != transform.ModeMITM {
-		return reject(tctx, "mitm_required")
+		return t.unidentified(tctx, "mitm_required")
 	}
 
 	ip, err := sourceIP(req.RemoteAddr)
 	if err != nil {
-		return reject(tctx, "bad_remote_addr")
+		return t.unidentified(tctx, "bad_remote_addr")
 	}
 	pod, err := t.pods.Resolve(ctx, ip)
 	switch {
 	case errors.Is(err, ErrNoPod):
-		return reject(tctx, "no_pod")
+		return t.unidentified(tctx, "no_pod")
 	case errors.Is(err, ErrAmbiguousPod):
-		return reject(tctx, "ambiguous_pod")
+		return t.unidentified(tctx, "ambiguous_pod")
 	case err != nil:
 		t.logger.Warn("spiffe_jwt_svid: pod lookup failed", slog.String("error", err.Error()))
-		return reject(tctx, "pod_lookup_failed")
+		return t.unidentified(tctx, "pod_lookup_failed")
 	}
 
 	svid, err := t.svidFor(ctx, pod.UID)
 	if err != nil {
 		t.logger.Warn("spiffe_jwt_svid: no svid", slog.String("pod_uid", pod.UID), slog.String("error", err.Error()))
-		return reject(tctx, "svid_unavailable")
+		return t.unidentified(tctx, "svid_unavailable")
 	}
 
 	req.Header.Set(t.header, "Bearer "+svid.Token)

@@ -389,3 +389,53 @@ func TestKubePodResolverConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestObserveModeNeverBlocks(t *testing.T) {
+	cases := []struct {
+		name   string
+		remote string
+		reason string
+	}{
+		{"unknown ip", "10.0.0.50:1", "no_pod"},
+		{"ambiguous ip", "10.0.0.99:1", "ambiguous_pod"},
+		{"no entry", "10.0.0.3:1", "svid_unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pods, f := setup()
+			tr := newTestTransform(t, pods, f)
+			tr.observe = true
+			r := request("executor.mcp.local", tc.remote, http.Header{defaultHeader: {"Bearer forged"}})
+			act, ann := run(t, tr, transform.ModeMITM, r)
+			require.Equal(t, transform.ActionContinue, act)
+			require.Equal(t, tc.reason, ann["unidentified"])
+			require.Nil(t, ann["rejected"])
+			require.Empty(t, r.Header.Get(defaultHeader), "forged header must still be stripped")
+		})
+	}
+
+	// Identifiable sources still get their identity in observe mode.
+	pods, f := setup()
+	tr := newTestTransform(t, pods, f)
+	tr.observe = true
+	r := request("executor.mcp.local", "10.0.0.1:1", nil)
+	act, _ := run(t, tr, transform.ModeMITM, r)
+	require.Equal(t, transform.ActionContinue, act)
+	require.Equal(t, "Bearer tok-a", r.Header.Get(defaultHeader))
+}
+
+func TestModeConfig(t *testing.T) {
+	pods, f := setup()
+	base := config{Audience: "a", TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/", Rules: []hostmatch.RuleConfig{{Host: "x"}}}
+	for _, mode := range []string{"", "enforce", "observe"} {
+		c := base
+		c.Mode = mode
+		tr, err := newFromConfig(c, slog.Default(), pods, f)
+		require.NoError(t, err, mode)
+		require.Equal(t, mode == "observe", tr.observe, mode)
+	}
+	c := base
+	c.Mode = "permissive"
+	_, err := newFromConfig(c, slog.Default(), pods, f)
+	require.Error(t, err)
+}
