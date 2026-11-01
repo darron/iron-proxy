@@ -43,6 +43,9 @@ func decodeJSONRPC(body []byte) ([]rpcMessage, bool, error) {
 	if len(trimmed) == 0 {
 		return nil, false, errMalformedJSONRPC
 	}
+	if err := checkUnambiguousKeys(trimmed); err != nil {
+		return nil, trimmed[0] == '[', fmt.Errorf("%w: %v", errMalformedJSONRPC, err)
+	}
 	if trimmed[0] == '[' {
 		var batch []rpcMessage
 		if err := json.Unmarshal(trimmed, &batch); err != nil {
