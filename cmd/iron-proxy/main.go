@@ -45,6 +45,7 @@ import (
 	_ "github.com/ironsh/iron-proxy/internal/transform/judge"
 	_ "github.com/ironsh/iron-proxy/internal/transform/oauth"
 	_ "github.com/ironsh/iron-proxy/internal/transform/secrets"
+	_ "github.com/ironsh/iron-proxy/internal/transform/spiffejwtsvid"
 )
 
 func main() {
