@@ -25,13 +25,13 @@ type kubeConfig struct {
 	APIServer     string        `yaml:"api_server,omitempty"`
 	TokenPath     string        `yaml:"token_path,omitempty"`
 	CAPath        string        `yaml:"ca_path,omitempty"`
-	Namespace     string        `yaml:"namespace"`
+	Namespaces    []string      `yaml:"namespaces"`
 	LabelSelector string        `yaml:"label_selector"`
 	CacheTTL      time.Duration `yaml:"cache_ttl,omitempty"`
 }
 
 // kubePodResolver looks a source IP up with a field-selected pod list:
-// one Running, non-terminating, non-hostNetwork pod in the namespace,
+// one Running, non-terminating, non-hostNetwork pod across the namespaces,
 // matching the label selector, whose status.podIP is the IP. Results
 // (including misses) are cached for CacheTTL, which bounds how long a
 // deleted pod can still resolve.
@@ -51,8 +51,13 @@ type cachedPod struct {
 }
 
 func newKubePodResolver(c kubeConfig) (*kubePodResolver, error) {
-	if c.Namespace == "" {
-		return nil, fmt.Errorf("\"kubernetes.namespace\" is required")
+	if len(c.Namespaces) == 0 {
+		return nil, fmt.Errorf("\"kubernetes.namespaces\" needs at least one namespace")
+	}
+	for _, ns := range c.Namespaces {
+		if ns == "" {
+			return nil, fmt.Errorf("\"kubernetes.namespaces\" contains an empty name")
+		}
 	}
 	if c.LabelSelector == "" {
 		return nil, fmt.Errorf("\"kubernetes.label_selector\" is required (scope lookups to sandbox pods)")
@@ -139,36 +144,57 @@ func (k *kubePodResolver) Resolve(ctx context.Context, ip string) (Pod, error) {
 }
 
 func (k *kubePodResolver) lookup(ctx context.Context, ip string) (Pod, error) {
+	// A source IP must map to exactly one eligible pod across every
+	// configured namespace, so each namespace is listed and the matches pooled.
+	var found []Pod
+	for _, ns := range k.cfg.Namespaces {
+		pods, err := k.list(ctx, ns, ip)
+		if err != nil {
+			return Pod{}, err
+		}
+		found = append(found, pods...)
+	}
+	switch len(found) {
+	case 0:
+		return Pod{}, ErrNoPod
+	case 1:
+		return found[0], nil
+	default:
+		return Pod{}, ErrAmbiguousPod
+	}
+}
+
+func (k *kubePodResolver) list(ctx context.Context, namespace, ip string) ([]Pod, error) {
 	q := url.Values{}
 	q.Set("labelSelector", k.cfg.LabelSelector)
 	q.Set("fieldSelector", "status.podIP="+ip+",status.phase=Running")
-	u := strings.TrimRight(k.cfg.APIServer, "/") + "/api/v1/namespaces/" + url.PathEscape(k.cfg.Namespace) + "/pods?" + q.Encode()
+	u := strings.TrimRight(k.cfg.APIServer, "/") + "/api/v1/namespaces/" + url.PathEscape(namespace) + "/pods?" + q.Encode()
 
 	token, err := os.ReadFile(k.cfg.TokenPath)
 	if err != nil {
-		return Pod{}, fmt.Errorf("reading service account token: %w", err)
+		return nil, fmt.Errorf("reading service account token: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return Pod{}, err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
 	req.Header.Set("Accept", "application/json")
 	resp, err := k.client.Do(req)
 	if err != nil {
-		return Pod{}, fmt.Errorf("listing pods: %w", err)
+		return nil, fmt.Errorf("listing pods: %w", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return Pod{}, fmt.Errorf("reading pod list: %w", err)
+		return nil, fmt.Errorf("reading pod list: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return Pod{}, fmt.Errorf("listing pods: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("listing pods: HTTP %d", resp.StatusCode)
 	}
 	var list podList
 	if err := json.Unmarshal(body, &list); err != nil {
-		return Pod{}, fmt.Errorf("decoding pod list: %w", err)
+		return nil, fmt.Errorf("decoding pod list: %w", err)
 	}
 
 	var found []Pod
@@ -182,14 +208,7 @@ func (k *kubePodResolver) lookup(ctx context.Context, ip string) (Pod, error) {
 		}
 		found = append(found, Pod{Namespace: it.Metadata.Namespace, Name: it.Metadata.Name, UID: it.Metadata.UID})
 	}
-	switch len(found) {
-	case 0:
-		return Pod{}, ErrNoPod
-	case 1:
-		return found[0], nil
-	default:
-		return Pod{}, ErrAmbiguousPod
-	}
+	return found, nil
 }
 
 func hasIP(primary string, all []struct {

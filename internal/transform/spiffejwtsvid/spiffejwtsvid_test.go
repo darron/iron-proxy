@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
+	"github.com/stretchr/testify/require"
 
 	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
@@ -37,7 +38,6 @@ type fakeFetcher struct {
 	mu      sync.Mutex
 	calls   int
 	byUID   map[string][]SVID // pod uid -> svids
-	lastSel []*types.Selector
 	lastAud string
 }
 
@@ -45,7 +45,7 @@ func (f *fakeFetcher) FetchJWTSVIDs(_ context.Context, aud string, sel []*types.
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
-	f.lastSel, f.lastAud = sel, aud
+	f.lastAud = aud
 	if len(sel) != 1 || sel[0].Type != "k8s" || !strings.HasPrefix(sel[0].Value, "pod-uid:") {
 		return nil, errors.New("bad selector")
 	}
@@ -70,9 +70,7 @@ func newTestTransform(t *testing.T, pods PodResolver, f SVIDFetcher) *Transform 
 		IDPrefix:    "/sandbox/",
 		Rules:       []hostmatch.RuleConfig{{Host: "executor.mcp.local"}},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)), pods, f)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	tr.now = func() time.Time { return t0.Add(time.Minute) }
 	return tr
 }
@@ -90,9 +88,7 @@ func run(t *testing.T, tr *Transform, mode transform.Mode, r *http.Request) (tra
 	t.Helper()
 	tctx := &transform.TransformContext{Mode: mode}
 	res, err := tr.TransformRequest(context.Background(), tctx, r)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	return res.Action, tctx.DrainAnnotations()
 }
 
@@ -115,25 +111,21 @@ func TestInjectsPerSandboxIdentity(t *testing.T) {
 
 	ra := request("executor.mcp.local", "10.0.0.1:41000", nil)
 	act, ann := run(t, tr, transform.ModeMITM, ra)
-	if act != transform.ActionContinue || ra.Header.Get(defaultHeader) != "Bearer tok-a" {
-		t.Fatalf("A: action=%v header=%q", act, ra.Header.Get(defaultHeader))
-	}
-	if ann["spiffe_id"] != "spiffe://sbx.interval.internal/sandbox/kata/a" || ann["pod_uid"] != "uid-a" {
-		t.Fatalf("A annotations: %v", ann)
-	}
+	require.Equal(t, transform.ActionContinue, act)
+	require.Equal(t, "Bearer tok-a", ra.Header.Get(defaultHeader))
+	require.Equal(t, "spiffe://sbx.interval.internal/sandbox/kata/a", ann["spiffe_id"])
+	require.Equal(t, "uid-a", ann["pod_uid"])
 	for _, v := range ann {
-		if s, ok := v.(string); ok && strings.Contains(s, "tok-") {
-			t.Fatalf("token leaked into audit annotations: %v", ann)
+		if s, ok := v.(string); ok {
+			require.NotContains(t, s, "tok-", "token leaked into audit annotations")
 		}
 	}
-	if f.lastAud != "executor" {
-		t.Fatalf("audience %q", f.lastAud)
-	}
+	require.Equal(t, "executor", f.lastAud)
 
 	rb := request("executor.mcp.local", "10.0.0.2:41000", nil)
-	if act, _ := run(t, tr, transform.ModeMITM, rb); act != transform.ActionContinue || rb.Header.Get(defaultHeader) != "Bearer tok-b" {
-		t.Fatalf("B: action=%v header=%q", act, rb.Header.Get(defaultHeader))
-	}
+	act, _ = run(t, tr, transform.ModeMITM, rb)
+	require.Equal(t, transform.ActionContinue, act)
+	require.Equal(t, "Bearer tok-b", rb.Header.Get(defaultHeader))
 }
 
 func TestForgedHeaderIsStrippedEverywhere(t *testing.T) {
@@ -144,42 +136,45 @@ func TestForgedHeaderIsStrippedEverywhere(t *testing.T) {
 	// Matching host: replaced with A's own identity.
 	r := request("executor.mcp.local", "10.0.0.1:1", forged)
 	run(t, tr, transform.ModeMITM, r)
-	if got := r.Header.Values(defaultHeader); len(got) != 1 || got[0] != "Bearer tok-a" {
-		t.Fatalf("matching host header = %v", got)
-	}
+	require.Equal(t, []string{"Bearer tok-a"}, r.Header.Values(defaultHeader))
+
 	// Non-matching host: removed, nothing injected.
 	r = request("example.com", "10.0.0.1:1", forged)
 	act, ann := run(t, tr, transform.ModeMITM, r)
-	if act != transform.ActionContinue || r.Header.Get(defaultHeader) != "" || ann["stripped"] == nil {
-		t.Fatalf("non-matching: action=%v header=%q ann=%v", act, r.Header.Get(defaultHeader), ann)
-	}
-	// Rejected request: forged value must not survive either.
+	require.Equal(t, transform.ActionContinue, act)
+	require.Empty(t, r.Header.Get(defaultHeader))
+	require.NotNil(t, ann["stripped"])
+
+	// Rejected request: the forged value must not survive either.
 	r = request("executor.mcp.local", "10.0.0.50:1", forged)
-	if act, _ := run(t, tr, transform.ModeMITM, r); act != transform.ActionReject || r.Header.Get(defaultHeader) != "" {
-		t.Fatalf("unknown source: action=%v header=%q", act, r.Header.Get(defaultHeader))
-	}
+	act, _ = run(t, tr, transform.ModeMITM, r)
+	require.Equal(t, transform.ActionReject, act)
+	require.Empty(t, r.Header.Get(defaultHeader))
 }
 
 func TestFailsClosed(t *testing.T) {
-	pods, f := setup()
-	tr := newTestTransform(t, pods, f)
-	cases := map[string]struct {
+	cases := []struct {
+		name   string
 		remote string
 		mode   transform.Mode
 		reason string
 	}{
-		"unknown ip":     {"10.0.0.50:1", transform.ModeMITM, "no_pod"},
-		"ambiguous ip":   {"10.0.0.99:1", transform.ModeMITM, "ambiguous_pod"},
-		"no entry":       {"10.0.0.3:1", transform.ModeMITM, "svid_unavailable"},
-		"sni only":       {"10.0.0.1:1", transform.ModeSNIOnly, "mitm_required"},
-		"bad remoteaddr": {"garbage", transform.ModeMITM, "bad_remote_addr"},
+		{"unknown ip", "10.0.0.50:1", transform.ModeMITM, "no_pod"},
+		{"ambiguous ip", "10.0.0.99:1", transform.ModeMITM, "ambiguous_pod"},
+		{"no entry", "10.0.0.3:1", transform.ModeMITM, "svid_unavailable"},
+		{"sni only", "10.0.0.1:1", transform.ModeSNIOnly, "mitm_required"},
+		{"bad remoteaddr", "garbage", transform.ModeMITM, "bad_remote_addr"},
 	}
-	for name, c := range cases {
-		r := request("executor.mcp.local", c.remote, nil)
-		act, ann := run(t, tr, c.mode, r)
-		if act != transform.ActionReject || ann["rejected"] != c.reason || r.Header.Get(defaultHeader) != "" {
-			t.Errorf("%s: action=%v ann=%v header=%q", name, act, ann, r.Header.Get(defaultHeader))
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pods, f := setup()
+			tr := newTestTransform(t, pods, f)
+			r := request("executor.mcp.local", tc.remote, nil)
+			act, ann := run(t, tr, tc.mode, r)
+			require.Equal(t, transform.ActionReject, act)
+			require.Equal(t, tc.reason, ann["rejected"])
+			require.Empty(t, r.Header.Get(defaultHeader))
+		})
 	}
 }
 
@@ -190,10 +185,9 @@ func TestRejectsWrongTrustDomainOrMultipleSVIDs(t *testing.T) {
 	f.byUID["uid-c"] = []SVID{svid("spiffe://sbx.interval.internal/iron-proxy", "tok")}
 	tr := newTestTransform(t, pods, f)
 	for _, ip := range []string{"10.0.0.1:1", "10.0.0.2:1", "10.0.0.3:1"} {
-		r := request("executor.mcp.local", ip, nil)
-		if act, ann := run(t, tr, transform.ModeMITM, r); act != transform.ActionReject || ann["rejected"] != "svid_unavailable" {
-			t.Errorf("%s: action=%v ann=%v", ip, act, ann)
-		}
+		act, ann := run(t, tr, transform.ModeMITM, request("executor.mcp.local", ip, nil))
+		require.Equal(t, transform.ActionReject, act, ip)
+		require.Equal(t, "svid_unavailable", ann["rejected"], ip)
 	}
 }
 
@@ -205,123 +199,24 @@ func TestCacheRefreshAndRevocation(t *testing.T) {
 
 	run(t, tr, transform.ModeMITM, request("executor.mcp.local", "10.0.0.1:1", nil))
 	run(t, tr, transform.ModeMITM, request("executor.mcp.local", "10.0.0.1:1", nil))
-	if f.calls != 1 {
-		t.Fatalf("expected cached SVID before half-life, calls=%d", f.calls)
-	}
+	require.Equal(t, 1, f.calls, "SVID should be cached before half-life")
 
-	// Entry deleted on the SPIRE side; past half-life the next fetch fails and
+	// Entry deleted on the SPIRE side: past half-life the next fetch fails and
 	// the request is refused (no stale token is reused).
 	delete(f.byUID, "uid-a")
 	clock = t0.Add(3 * time.Minute)
-	r := request("executor.mcp.local", "10.0.0.1:1", nil)
-	if act, ann := run(t, tr, transform.ModeMITM, r); act != transform.ActionReject || ann["rejected"] != "svid_unavailable" {
-		t.Fatalf("after entry deletion: action=%v ann=%v", act, ann)
-	}
+	act, ann := run(t, tr, transform.ModeMITM, request("executor.mcp.local", "10.0.0.1:1", nil))
+	require.Equal(t, transform.ActionReject, act)
+	require.Equal(t, "svid_unavailable", ann["rejected"])
 
-	// Pod deleted: resolver no longer maps the IP, refused immediately even
-	// though B's token is cached.
+	// Pod deleted: the resolver no longer maps the IP, so the request is
+	// refused immediately even though B's token is cached.
 	run(t, tr, transform.ModeMITM, request("executor.mcp.local", "10.0.0.2:1", nil))
 	delete(pods, "10.0.0.2")
-	if act, ann := run(t, tr, transform.ModeMITM, request("executor.mcp.local", "10.0.0.2:1", nil)); act != transform.ActionReject || ann["rejected"] != "no_pod" {
-		t.Fatalf("after pod deletion: action=%v ann=%v", act, ann)
-	}
+	act, ann = run(t, tr, transform.ModeMITM, request("executor.mcp.local", "10.0.0.2:1", nil))
+	require.Equal(t, transform.ActionReject, act)
+	require.Equal(t, "no_pod", ann["rejected"])
 }
-
-func TestConfigValidation(t *testing.T) {
-	pods, f := setup()
-	base := config{Audience: "a", TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/", Rules: []hostmatch.RuleConfig{{Host: "x"}}}
-	bad := []func(c *config){
-		func(c *config) { c.Audience = "" },
-		func(c *config) { c.TrustDomain = "spiffe://sbx" },
-		func(c *config) { c.IDPrefix = "/" },
-		func(c *config) { c.IDPrefix = "sandbox" },
-		func(c *config) { c.Rules = nil },
-		func(c *config) { c.Header = "Proxy-Authorization" },
-	}
-	for i, mut := range bad {
-		c := base
-		mut(&c)
-		if _, err := newFromConfig(c, slog.Default(), pods, f); err == nil {
-			t.Errorf("case %d: expected error", i)
-		}
-	}
-	if _, err := newFromConfig(base, slog.Default(), pods, f); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestKubePodResolver(t *testing.T) {
-	var gotQuery, gotAuth string
-	items := []map[string]any{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotQuery, gotAuth = r.URL.RawQuery, r.Header.Get("Authorization")
-		if r.URL.Path != "/api/v1/namespaces/opensandbox-lab/pods" {
-			http.NotFound(w, r)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
-	}))
-	defer srv.Close()
-
-	tokenFile := t.TempDir() + "/token"
-	if err := writeFile(tokenFile, "sa-token\n"); err != nil {
-		t.Fatal(err)
-	}
-	k := newKubePodResolverWithClient(kubeConfig{APIServer: srv.URL, TokenPath: tokenFile, Namespace: "opensandbox-lab", LabelSelector: "sbx-run", CacheTTL: time.Second}, srv.Client())
-	clock := t0
-	k.now = func() time.Time { return clock }
-
-	pod := func(name, uid, ip string, mods ...func(m map[string]any)) map[string]any {
-		m := map[string]any{
-			"metadata": map[string]any{"name": name, "namespace": "opensandbox-lab", "uid": uid},
-			"spec":     map[string]any{},
-			"status":   map[string]any{"phase": "Running", "podIP": ip},
-		}
-		for _, mod := range mods {
-			mod(m)
-		}
-		return m
-	}
-
-	items = []map[string]any{pod("sb-a", "uid-a", "10.0.0.1")}
-	p, err := k.Resolve(context.Background(), "10.0.0.1")
-	if err != nil || p.UID != "uid-a" {
-		t.Fatalf("resolve: %v %v", p, err)
-	}
-	if gotAuth != "Bearer sa-token" || !strings.Contains(gotQuery, "fieldSelector=status.podIP%3D10.0.0.1%2Cstatus.phase%3DRunning") || !strings.Contains(gotQuery, "labelSelector=sbx-run") {
-		t.Fatalf("query=%q auth=%q", gotQuery, gotAuth)
-	}
-
-	// Cached within TTL even if the pod disappears; refreshed after.
-	items = nil
-	if p, _ := k.Resolve(context.Background(), "10.0.0.1"); p.UID != "uid-a" {
-		t.Fatal("expected cache hit")
-	}
-	clock = clock.Add(2 * time.Second)
-	if _, err := k.Resolve(context.Background(), "10.0.0.1"); !errors.Is(err, ErrNoPod) {
-		t.Fatalf("after TTL: %v", err)
-	}
-
-	// Local re-checks: terminating, hostNetwork, wrong IP, not Running are ignored.
-	clock = clock.Add(2 * time.Second)
-	items = []map[string]any{
-		pod("del", "u1", "10.0.0.5", func(m map[string]any) { m["metadata"].(map[string]any)["deletionTimestamp"] = "2026-11-01T00:00:00Z" }),
-		pod("host", "u2", "10.0.0.5", func(m map[string]any) { m["spec"] = map[string]any{"hostNetwork": true} }),
-		pod("other", "u3", "10.0.0.6"),
-		pod("pending", "u4", "10.0.0.5", func(m map[string]any) { m["status"].(map[string]any)["phase"] = "Pending" }),
-	}
-	if _, err := k.Resolve(context.Background(), "10.0.0.5"); !errors.Is(err, ErrNoPod) {
-		t.Fatalf("filtered: %v", err)
-	}
-
-	clock = clock.Add(2 * time.Second)
-	items = []map[string]any{pod("x", "u5", "10.0.0.7"), pod("y", "u6", "10.0.0.7")}
-	if _, err := k.Resolve(context.Background(), "10.0.0.7"); !errors.Is(err, ErrAmbiguousPod) {
-		t.Fatalf("ambiguous: %v", err)
-	}
-}
-
-func writeFile(path, content string) error { return os.WriteFile(path, []byte(content), 0o600) }
 
 func TestConnectPassesWithoutIdentity(t *testing.T) {
 	pods, f := setup()
@@ -331,7 +226,166 @@ func TestConnectPassesWithoutIdentity(t *testing.T) {
 	r.RemoteAddr = "10.0.0.50:1" // unknown source: still not refused at CONNECT
 	r.Header.Set(defaultHeader, "Bearer forged")
 	act, _ := run(t, tr, transform.ModeSNIOnly, r)
-	if act != transform.ActionContinue || r.Header.Get(defaultHeader) != "" || f.calls != 0 {
-		t.Fatalf("CONNECT: action=%v header=%q calls=%d", act, r.Header.Get(defaultHeader), f.calls)
+	require.Equal(t, transform.ActionContinue, act)
+	require.Empty(t, r.Header.Get(defaultHeader))
+	require.Equal(t, 0, f.calls)
+}
+
+func TestConfigValidation(t *testing.T) {
+	base := config{Audience: "a", TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/", Rules: []hostmatch.RuleConfig{{Host: "x"}}}
+	cases := []struct {
+		name string
+		mut  func(c *config)
+	}{
+		{"no audience", func(c *config) { c.Audience = "" }},
+		{"trust domain with scheme", func(c *config) { c.TrustDomain = "spiffe://sbx" }},
+		{"root prefix", func(c *config) { c.IDPrefix = "/" }},
+		{"relative prefix", func(c *config) { c.IDPrefix = "sandbox" }},
+		{"no rules", func(c *config) { c.Rules = nil }},
+		{"forbidden header", func(c *config) { c.Header = "Proxy-Authorization" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pods, f := setup()
+			c := base
+			tc.mut(&c)
+			_, err := newFromConfig(c, slog.Default(), pods, f)
+			require.Error(t, err)
+		})
+	}
+	pods, f := setup()
+	_, err := newFromConfig(base, slog.Default(), pods, f)
+	require.NoError(t, err)
+}
+
+func kubePod(ns, name, uid, ip string, mods ...func(m map[string]any)) map[string]any {
+	m := map[string]any{
+		"metadata": map[string]any{"name": name, "namespace": ns, "uid": uid},
+		"spec":     map[string]any{},
+		"status":   map[string]any{"phase": "Running", "podIP": ip},
+	}
+	for _, mod := range mods {
+		mod(m)
+	}
+	return m
+}
+
+// fakeAPIServer serves pod lists per namespace from items and records the
+// last query and Authorization header.
+type fakeAPIServer struct {
+	mu        sync.Mutex
+	items     map[string][]map[string]any // namespace -> pods
+	gotQuery  string
+	gotAuth   string
+	gotPaths  []string
+	srv       *httptest.Server
+	tokenFile string
+}
+
+func newFakeAPIServer(t *testing.T) *fakeAPIServer {
+	t.Helper()
+	f := &fakeAPIServer{items: map[string][]map[string]any{}}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.gotQuery, f.gotAuth = r.URL.RawQuery, r.Header.Get("Authorization")
+		f.gotPaths = append(f.gotPaths, r.URL.Path)
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/namespaces/"), "/")
+		if len(parts) != 2 || parts[1] != "pods" {
+			http.NotFound(w, r)
+			return
+		}
+		// Encoding a map of plain values cannot fail.
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": f.items[parts[0]]})
+	}))
+	t.Cleanup(f.srv.Close)
+	f.tokenFile = t.TempDir() + "/token"
+	require.NoError(t, os.WriteFile(f.tokenFile, []byte("sa-token\n"), 0o600))
+	return f
+}
+
+func (f *fakeAPIServer) set(ns string, pods ...map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.items[ns] = pods
+}
+
+func TestKubePodResolver(t *testing.T) {
+	api := newFakeAPIServer(t)
+	k := newKubePodResolverWithClient(kubeConfig{APIServer: api.srv.URL, TokenPath: api.tokenFile, Namespaces: []string{"opensandbox-lab"}, LabelSelector: "sbx-run", CacheTTL: time.Second}, api.srv.Client())
+	clock := t0
+	k.now = func() time.Time { return clock }
+
+	api.set("opensandbox-lab", kubePod("opensandbox-lab", "sb-a", "uid-a", "10.0.0.1"))
+	p, err := k.Resolve(context.Background(), "10.0.0.1")
+	require.NoError(t, err)
+	require.Equal(t, "uid-a", p.UID)
+	require.Equal(t, "Bearer sa-token", api.gotAuth)
+	require.Contains(t, api.gotQuery, "fieldSelector=status.podIP%3D10.0.0.1%2Cstatus.phase%3DRunning")
+	require.Contains(t, api.gotQuery, "labelSelector=sbx-run")
+
+	// Cached within TTL even if the pod disappears; refreshed after.
+	api.set("opensandbox-lab")
+	p, err = k.Resolve(context.Background(), "10.0.0.1")
+	require.NoError(t, err)
+	require.Equal(t, "uid-a", p.UID)
+	clock = clock.Add(2 * time.Second)
+	_, err = k.Resolve(context.Background(), "10.0.0.1")
+	require.ErrorIs(t, err, ErrNoPod)
+
+	// Local re-checks: terminating, hostNetwork, wrong IP, not Running are ignored.
+	clock = clock.Add(2 * time.Second)
+	api.set("opensandbox-lab",
+		kubePod("opensandbox-lab", "del", "u1", "10.0.0.5", func(m map[string]any) {
+			m["metadata"].(map[string]any)["deletionTimestamp"] = "2026-11-01T00:00:00Z"
+		}),
+		kubePod("opensandbox-lab", "host", "u2", "10.0.0.5", func(m map[string]any) { m["spec"] = map[string]any{"hostNetwork": true} }),
+		kubePod("opensandbox-lab", "other", "u3", "10.0.0.6"),
+		kubePod("opensandbox-lab", "pending", "u4", "10.0.0.5", func(m map[string]any) { m["status"].(map[string]any)["phase"] = "Pending" }),
+	)
+	_, err = k.Resolve(context.Background(), "10.0.0.5")
+	require.ErrorIs(t, err, ErrNoPod)
+
+	clock = clock.Add(2 * time.Second)
+	api.set("opensandbox-lab", kubePod("opensandbox-lab", "x", "u5", "10.0.0.7"), kubePod("opensandbox-lab", "y", "u6", "10.0.0.7"))
+	_, err = k.Resolve(context.Background(), "10.0.0.7")
+	require.ErrorIs(t, err, ErrAmbiguousPod)
+}
+
+func TestKubePodResolverAcrossNamespaces(t *testing.T) {
+	api := newFakeAPIServer(t)
+	k := newKubePodResolverWithClient(kubeConfig{APIServer: api.srv.URL, TokenPath: api.tokenFile, Namespaces: []string{"opensandbox-lab", "opensandbox-kata-build"}, LabelSelector: "sbx-run", CacheTTL: time.Second}, api.srv.Client())
+	clock := t0
+	k.now = func() time.Time { return clock }
+
+	// A pod in the second namespace resolves, and both namespaces are queried.
+	api.set("opensandbox-kata-build", kubePod("opensandbox-kata-build", "build", "uid-b", "10.0.1.1"))
+	p, err := k.Resolve(context.Background(), "10.0.1.1")
+	require.NoError(t, err)
+	require.Equal(t, Pod{Namespace: "opensandbox-kata-build", Name: "build", UID: "uid-b"}, p)
+	require.Equal(t, []string{"/api/v1/namespaces/opensandbox-lab/pods", "/api/v1/namespaces/opensandbox-kata-build/pods"}, api.gotPaths)
+
+	// The same IP claimed in two namespaces is ambiguous, never first-wins.
+	clock = clock.Add(2 * time.Second)
+	api.set("opensandbox-lab", kubePod("opensandbox-lab", "lab", "uid-a", "10.0.1.1"))
+	_, err = k.Resolve(context.Background(), "10.0.1.1")
+	require.ErrorIs(t, err, ErrAmbiguousPod)
+}
+
+func TestKubePodResolverConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  kubeConfig
+	}{
+		{"no namespaces", kubeConfig{LabelSelector: "sbx-run"}},
+		{"empty namespace", kubeConfig{Namespaces: []string{""}, LabelSelector: "sbx-run"}},
+		{"no label selector", kubeConfig{Namespaces: []string{"opensandbox-lab"}}},
+		{"cache ttl too long", kubeConfig{Namespaces: []string{"opensandbox-lab"}, LabelSelector: "sbx-run", CacheTTL: time.Minute}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := newKubePodResolver(tc.cfg)
+			require.Error(t, err)
+		})
 	}
 }
