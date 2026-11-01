@@ -47,14 +47,25 @@ func init() {
 }
 
 type config struct {
-	AdminSocket string                 `yaml:"admin_socket"`
-	Audience    string                 `yaml:"audience"`
-	Header      string                 `yaml:"header,omitempty"`
-	TrustDomain string                 `yaml:"trust_domain"`
-	IDPrefix    string                 `yaml:"id_prefix"`
-	Mode        string                 `yaml:"mode,omitempty"`
-	Kubernetes  kubeConfig             `yaml:"kubernetes"`
-	Rules       []hostmatch.RuleConfig `yaml:"rules"`
+	AdminSocket string        `yaml:"admin_socket"`
+	Header      string        `yaml:"header,omitempty"`
+	TrustDomain string        `yaml:"trust_domain"`
+	IDPrefix    string        `yaml:"id_prefix"`
+	Mode        string        `yaml:"mode,omitempty"`
+	Kubernetes  kubeConfig    `yaml:"kubernetes"`
+	Routes      []routeConfig `yaml:"routes"`
+}
+
+// routeConfig binds a set of destinations to one JWT audience, so a token
+// minted for one upstream is not accepted by another.
+type routeConfig struct {
+	Audience string                 `yaml:"audience"`
+	Rules    []hostmatch.RuleConfig `yaml:"rules"`
+}
+
+type route struct {
+	audience string
+	rules    []hostmatch.Rule
 }
 
 // Pod is the minimal view of the pod that owns a source IP.
@@ -91,8 +102,7 @@ type SVIDFetcher interface {
 
 // Transform is the spiffe_jwt_svid transform.
 type Transform struct {
-	rules       []hostmatch.Rule
-	audience    string
+	routes      []route
 	header      string
 	trustDomain string
 	idPrefix    string
@@ -103,7 +113,7 @@ type Transform struct {
 	logger      *slog.Logger
 
 	mu    sync.Mutex
-	cache map[string]SVID // keyed by pod UID
+	cache map[cacheKey]SVID
 }
 
 func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) {
@@ -126,21 +136,28 @@ func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) 
 }
 
 func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVIDFetcher) (*Transform, error) {
-	if c.Audience == "" {
-		return nil, fmt.Errorf("%s: \"audience\" is required", name)
-	}
 	if c.TrustDomain == "" || strings.ContainsAny(c.TrustDomain, "/:") {
 		return nil, fmt.Errorf("%s: \"trust_domain\" is required and must be a bare trust domain name", name)
 	}
 	if !strings.HasPrefix(c.IDPrefix, "/") || !strings.HasSuffix(c.IDPrefix, "/") || len(c.IDPrefix) < 3 {
 		return nil, fmt.Errorf("%s: \"id_prefix\" must be a path like \"/sandbox/\"", name)
 	}
-	rules, err := hostmatch.CompileRules(c.Rules, name)
-	if err != nil {
-		return nil, err
+	if len(c.Routes) == 0 {
+		return nil, fmt.Errorf("%s: at least one entry in \"routes\" is required", name)
 	}
-	if len(rules) == 0 {
-		return nil, fmt.Errorf("%s: at least one entry in \"rules\" is required", name)
+	routes := make([]route, 0, len(c.Routes))
+	for i, rc := range c.Routes {
+		if rc.Audience == "" {
+			return nil, fmt.Errorf("%s: routes[%d] needs an \"audience\"", name, i)
+		}
+		rules, err := hostmatch.CompileRules(rc.Rules, name)
+		if err != nil {
+			return nil, err
+		}
+		if len(rules) == 0 {
+			return nil, fmt.Errorf("%s: routes[%d] needs at least one entry in \"rules\"", name, i)
+		}
+		routes = append(routes, route{audience: rc.Audience, rules: rules})
 	}
 	header := http.CanonicalHeaderKey(strings.TrimSpace(c.Header))
 	if header == "" {
@@ -159,8 +176,7 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 		return nil, fmt.Errorf("%s: \"mode\" must be \"enforce\" or \"observe\"", name)
 	}
 	return &Transform{
-		rules:       rules,
-		audience:    c.Audience,
+		routes:      routes,
 		header:      header,
 		trustDomain: c.TrustDomain,
 		idPrefix:    c.IDPrefix,
@@ -169,7 +185,7 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 		fetcher:     fetcher,
 		now:         time.Now,
 		logger:      logger,
-		cache:       make(map[string]SVID),
+		cache:       make(map[cacheKey]SVID),
 	}, nil
 }
 
@@ -198,7 +214,11 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 
 	// A CONNECT only opens a tunnel; each request inside it passes through
 	// this transform again and carries the identity there.
-	if req.Method == http.MethodConnect || !hostmatch.MatchAnyRule(t.rules, req) {
+	if req.Method == http.MethodConnect {
+		return &transform.TransformResult{Action: transform.ActionContinue}, nil
+	}
+	audience, ok := t.audienceFor(req)
+	if !ok {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 	if tctx.Mode != transform.ModeMITM {
@@ -220,7 +240,7 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 		return t.unidentified(tctx, "pod_lookup_failed")
 	}
 
-	svid, err := t.svidFor(ctx, pod.UID)
+	svid, err := t.svidFor(ctx, pod.UID, audience)
 	if err != nil {
 		t.logger.Warn("spiffe_jwt_svid: no svid", slog.String("pod_uid", pod.UID), slog.String("error", err.Error()))
 		return t.unidentified(tctx, "svid_unavailable")
@@ -230,7 +250,7 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 	tctx.Annotate("spiffe_id", svid.SPIFFEID)
 	tctx.Annotate("pod", pod.Namespace+"/"+pod.Name)
 	tctx.Annotate("pod_uid", pod.UID)
-	tctx.Annotate("audience", t.audience)
+	tctx.Annotate("audience", audience)
 	tctx.Annotate("injected", []string{"header:" + t.header})
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
@@ -239,13 +259,27 @@ func (t *Transform) TransformResponse(context.Context, *transform.TransformConte
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
 
+// audienceFor returns the audience of the first route matching req.
+func (t *Transform) audienceFor(req *http.Request) (string, bool) {
+	for _, r := range t.routes {
+		if hostmatch.MatchAnyRule(r.rules, req) {
+			return r.audience, true
+		}
+	}
+	return "", false
+}
+
+type cacheKey struct{ podUID, audience string }
+
 // svidFor returns a cached SVID until half its lifetime has passed, then
 // fetches a fresh one. A fetch failure evicts the cache entry, so deleting
 // the registration entry stops injection at the next refresh at the latest.
-func (t *Transform) svidFor(ctx context.Context, podUID string) (SVID, error) {
+// Expired entries (for example of deleted pods) are pruned on every store.
+func (t *Transform) svidFor(ctx context.Context, podUID, audience string) (SVID, error) {
 	now := t.now()
+	key := cacheKey{podUID, audience}
 	t.mu.Lock()
-	cached, ok := t.cache[podUID]
+	cached, ok := t.cache[key]
 	t.mu.Unlock()
 	if ok && now.Before(cached.IssuedAt.Add(cached.ExpiresAt.Sub(cached.IssuedAt)/2)) {
 		return cached, nil
@@ -253,19 +287,24 @@ func (t *Transform) svidFor(ctx context.Context, podUID string) (SVID, error) {
 
 	fctx, cancel := context.WithTimeout(ctx, defaultFetchTimeout)
 	defer cancel()
-	svids, err := t.fetcher.FetchJWTSVIDs(fctx, t.audience, []*types.Selector{{Type: "k8s", Value: "pod-uid:" + podUID}})
+	svids, err := t.fetcher.FetchJWTSVIDs(fctx, audience, []*types.Selector{{Type: "k8s", Value: "pod-uid:" + podUID}})
 	if err == nil {
 		var svid SVID
 		svid, err = t.pickSVID(svids, now)
 		if err == nil {
 			t.mu.Lock()
-			t.cache[podUID] = svid
+			for k, v := range t.cache {
+				if !v.ExpiresAt.After(now) {
+					delete(t.cache, k)
+				}
+			}
+			t.cache[key] = svid
 			t.mu.Unlock()
 			return svid, nil
 		}
 	}
 	t.mu.Lock()
-	delete(t.cache, podUID)
+	delete(t.cache, key)
 	t.mu.Unlock()
 	return SVID{}, err
 }
