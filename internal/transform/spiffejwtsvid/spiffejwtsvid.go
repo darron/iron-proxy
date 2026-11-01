@@ -43,7 +43,7 @@ const (
 	defaultHeader       = "X-Sbx-Identity"
 	defaultPodCacheTTL  = 2 * time.Second
 	defaultFetchTimeout = 5 * time.Second
-	relayPollInterval   = 500 * time.Millisecond
+	pollInterval        = 500 * time.Millisecond
 )
 
 func init() {
@@ -59,6 +59,10 @@ type config struct {
 	Kubernetes  kubeConfig    `yaml:"kubernetes"`
 	Routes      []routeConfig `yaml:"routes"`
 	Relay       *relayConfig  `yaml:"relay,omitempty"`
+	// Wait bounds how long a request waits for a newly created workload's
+	// entry to reach the agent (SPIRE answers PermissionDenied until it
+	// does), on both the pod and relay paths. Zero means no wait; at most 15s.
+	Wait time.Duration `yaml:"wait,omitempty"`
 }
 
 // relayConfig handles requests that arrived on iron-proxy's trusted relay
@@ -69,10 +73,6 @@ type relayConfig struct {
 	IDPattern      string `yaml:"id_pattern"`
 	SelectorType   string `yaml:"selector_type"`
 	SelectorPrefix string `yaml:"selector_prefix"`
-	// Wait bounds how long a relayed request waits for a newly created
-	// workload's entry to reach the agent (SPIRE answers PermissionDenied
-	// until it does). Zero means no wait; at most 15s.
-	Wait time.Duration `yaml:"wait,omitempty"`
 	// Source names the gateway pods allowed to relay: the connection's source
 	// IP must belong to exactly one Running pod matching it. This backs up
 	// the network policy that restricts who can reach the relay listener.
@@ -89,7 +89,6 @@ type relay struct {
 	selectorType   string
 	selectorPrefix string
 	source         PodResolver
-	wait           time.Duration
 }
 
 // routeConfig binds a set of destinations to one JWT audience, so a token
@@ -143,6 +142,7 @@ type Transform struct {
 	trustDomain string
 	idPrefix    string
 	observe     bool
+	wait        time.Duration
 	relay       *relay
 	pods        PodResolver
 	fetcher     SVIDFetcher
@@ -226,6 +226,9 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 	default:
 		return nil, fmt.Errorf("%s: \"mode\" must be \"enforce\" or \"observe\"", name)
 	}
+	if c.Wait < 0 || c.Wait > 15*time.Second {
+		return nil, fmt.Errorf("%s: wait must be between 0 and 15s", name)
+	}
 	var rl *relay
 	if c.Relay != nil {
 		if !strings.HasPrefix(c.Relay.IDPattern, "^") || !strings.HasSuffix(c.Relay.IDPattern, "$") {
@@ -244,10 +247,7 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 		if len(c.Relay.Source.Namespaces) == 0 || c.Relay.Source.LabelSelector == "" {
 			return nil, fmt.Errorf("%s: relay.source needs namespaces and a label_selector naming the gateway pods", name)
 		}
-		if c.Relay.Wait < 0 || c.Relay.Wait > 15*time.Second {
-			return nil, fmt.Errorf("%s: relay.wait must be between 0 and 15s", name)
-		}
-		rl = &relay{re: re, selectorType: c.Relay.SelectorType, selectorPrefix: c.Relay.SelectorPrefix, wait: c.Relay.Wait}
+		rl = &relay{re: re, selectorType: c.Relay.SelectorType, selectorPrefix: c.Relay.SelectorPrefix}
 	}
 	return &Transform{
 		routes:      routes,
@@ -255,6 +255,7 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 		trustDomain: c.TrustDomain,
 		idPrefix:    c.IDPrefix,
 		observe:     observe,
+		wait:        c.Wait,
 		relay:       rl,
 		pods:        pods,
 		fetcher:     fetcher,
@@ -320,7 +321,7 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 		return t.unidentified(tctx, "pod_lookup_failed")
 	}
 
-	svid, err := t.svidFor(ctx, "pod:"+pod.UID, &types.Selector{Type: "k8s", Value: "pod-uid:" + pod.UID}, audience)
+	svid, err := t.svidWithWait(ctx, "pod:"+pod.UID, &types.Selector{Type: "k8s", Value: "pod-uid:" + pod.UID}, audience)
 	if err != nil {
 		t.logger.Warn("spiffe_jwt_svid: no svid", slog.String("pod_uid", pod.UID), slog.String("error", err.Error()))
 		return t.unidentified(tctx, "svid_unavailable")
@@ -358,27 +359,7 @@ func (t *Transform) relayIdentity(ctx context.Context, tctx *transform.Transform
 		return t.unidentified(tctx, "relay_peer_mismatch")
 	}
 	sel := &types.Selector{Type: t.relay.selectorType, Value: t.relay.selectorPrefix + m[1]}
-	// A just-created workload's entry may not have reached the agent yet, so
-	// with relay.wait set, poll while SPIRE says the identity is not issued.
-	// One overall deadline bounds the first fetch, every retry RPC and every
-	// sleep, so the request never waits longer than relay.wait.
-	fctx := ctx
-	if t.relay.wait > 0 {
-		var cancel context.CancelFunc
-		fctx, cancel = context.WithTimeout(ctx, t.relay.wait)
-		defer cancel()
-	}
-	subject := "relay:" + sel.Type + ":" + sel.Value
-	svid, err := t.svidFor(fctx, subject, sel, audience)
-	for t.relay.wait > 0 && err != nil && status.Code(err) == codes.PermissionDenied && fctx.Err() == nil {
-		timer := time.NewTimer(relayPollInterval)
-		select {
-		case <-fctx.Done():
-			timer.Stop()
-		case <-timer.C:
-			svid, err = t.svidFor(fctx, subject, sel, audience)
-		}
-	}
+	svid, err := t.svidWithWait(ctx, "relay:"+sel.Type+":"+sel.Value, sel, audience)
 	if err != nil {
 		t.logger.Warn("spiffe_jwt_svid: no svid for relayed peer", slog.String("peer", peer), slog.String("error", err.Error()))
 		return t.unidentified(tctx, "svid_unavailable")
@@ -393,6 +374,31 @@ func (t *Transform) relayIdentity(ctx context.Context, tctx *transform.Transform
 
 func (t *Transform) TransformResponse(context.Context, *transform.TransformContext, *http.Request, *http.Response) (*transform.TransformResult, error) {
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+// svidWithWait fetches an SVID and, when wait is configured, keeps polling
+// while SPIRE says the identity is not issued yet (a just-created workload's
+// entry still propagating to the agent). One overall deadline bounds the
+// first fetch, every retry RPC and every sleep, so a request never waits
+// longer than wait; client cancellation ends it; other errors and
+// multiple-SVID answers return at once.
+func (t *Transform) svidWithWait(ctx context.Context, subject string, sel *types.Selector, audience string) (SVID, error) {
+	if t.wait <= 0 {
+		return t.svidFor(ctx, subject, sel, audience)
+	}
+	fctx, cancel := context.WithTimeout(ctx, t.wait)
+	defer cancel()
+	svid, err := t.svidFor(fctx, subject, sel, audience)
+	for err != nil && status.Code(err) == codes.PermissionDenied && fctx.Err() == nil {
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-fctx.Done():
+			timer.Stop()
+		case <-timer.C:
+			svid, err = t.svidFor(fctx, subject, sel, audience)
+		}
+	}
+	return svid, err
 }
 
 // audienceFor returns the audience of the first route matching req.

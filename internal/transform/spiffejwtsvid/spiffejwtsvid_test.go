@@ -41,6 +41,8 @@ type fakeFetcher struct {
 	calls   int
 	byUID   map[string][]SVID // pod uid -> svids
 	lastAud string
+	// podPending answers PermissionDenied for this many pod fetches first.
+	podPending int
 }
 
 func (f *fakeFetcher) FetchJWTSVIDs(_ context.Context, aud string, sel []*types.Selector) ([]SVID, error) {
@@ -51,9 +53,13 @@ func (f *fakeFetcher) FetchJWTSVIDs(_ context.Context, aud string, sel []*types.
 	if len(sel) != 1 || sel[0].Type != "k8s" || !strings.HasPrefix(sel[0].Value, "pod-uid:") {
 		return nil, errors.New("bad selector")
 	}
+	if f.podPending > 0 {
+		f.podPending--
+		return nil, status.Error(codes.PermissionDenied, "no identity issued")
+	}
 	s, ok := f.byUID[strings.TrimPrefix(sel[0].Value, "pod-uid:")]
 	if !ok {
-		return nil, errors.New("PermissionDenied: no identity issued")
+		return nil, status.Error(codes.PermissionDenied, "no identity issued")
 	}
 	return s, nil
 }
@@ -646,7 +652,7 @@ func TestRelayFromUntrustedSourceIsRefused(t *testing.T) {
 
 func TestRelayWaitsForPropagatingEntry(t *testing.T) {
 	tr, f := newRelayTransform(t)
-	tr.relay.wait = 3 * time.Second
+	tr.wait = 3 * time.Second
 	f.pending = 2 // entry reaches the agent on the third poll
 	r := request("router.local", gatewayIP+":1", nil)
 	start := time.Now()
@@ -673,7 +679,7 @@ func TestRelayWaitIsBoundedAndOnlyForNotIssued(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tr, f := newRelayTransform(t)
-			tr.relay.wait = tc.wait
+			tr.wait = tc.wait
 			f.pending = tc.pending
 			f.otherErr = tc.otherErr
 			r := request("router.local", gatewayIP+":1", nil)
@@ -687,19 +693,19 @@ func TestRelayWaitIsBoundedAndOnlyForNotIssued(t *testing.T) {
 
 func TestRelayWaitBoundsStalledRPC(t *testing.T) {
 	tr, f := newRelayTransform(t)
-	tr.relay.wait = 700 * time.Millisecond
+	tr.wait = 700 * time.Millisecond
 	f.stall = true
 	r := request("router.local", gatewayIP+":1", nil)
 	start := time.Now()
 	act, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), axPeer), r)
 	require.Equal(t, transform.ActionReject, act)
 	require.Equal(t, "svid_unavailable", ann["rejected"])
-	require.Less(t, time.Since(start), 1500*time.Millisecond, "a stalled RPC must not outlast relay.wait")
+	require.Less(t, time.Since(start), 1500*time.Millisecond, "a stalled RPC must not outlast wait")
 }
 
 func TestRelayWaitStopsOnClientCancel(t *testing.T) {
 	tr, f := newRelayTransform(t)
-	tr.relay.wait = 10 * time.Second
+	tr.wait = 10 * time.Second
 	f.pending = 1000
 	ctx, cancel := context.WithTimeout(transform.WithRelayPeer(context.Background(), axPeer), 600*time.Millisecond)
 	defer cancel()
@@ -713,7 +719,7 @@ func TestRelayWaitStopsOnClientCancel(t *testing.T) {
 
 func TestRelayMultipleSVIDsRefusedWithoutWaiting(t *testing.T) {
 	tr, f := newRelayTransform(t)
-	tr.relay.wait = 3 * time.Second
+	tr.wait = 3 * time.Second
 	f.bySel["sbx:ax-actor:sbx-abc123"] = []SVID{
 		svid("spiffe://sbx.interval.internal/sandbox/ax/sbx-abc123/i/x", "t1"),
 		svid("spiffe://sbx.interval.internal/sandbox/ax/sbx-abc123/i/y", "t2"),
@@ -724,4 +730,46 @@ func TestRelayMultipleSVIDsRefusedWithoutWaiting(t *testing.T) {
 	require.Equal(t, "svid_unavailable", ann["rejected"])
 	require.Equal(t, 1, f.calls)
 	require.Empty(t, r.Header.Get(defaultHeader))
+}
+
+func TestPodPathWaitsForPropagatingEntry(t *testing.T) {
+	pods, f := setup()
+	tr := newTestTransform(t, pods, f)
+	tr.wait = 3 * time.Second
+	f.podPending = 2 // a fresh guest's pod entry reaches the agent on the third poll
+	r := request("executor.mcp.local", "10.0.0.1:1", nil)
+	act, ann := run(t, tr, transform.ModeMITM, r)
+	require.Equal(t, transform.ActionContinue, act)
+	require.Equal(t, "Bearer tok-a", r.Header.Get(defaultHeader))
+	require.Equal(t, "uid-a", ann["pod_uid"])
+	require.Equal(t, 3, f.calls)
+}
+
+func TestPodPathWithoutEntryStillRefusedAfterWait(t *testing.T) {
+	pods, f := setup()
+	tr := newTestTransform(t, pods, f)
+	tr.wait = 1200 * time.Millisecond
+	r := request("executor.mcp.local", "10.0.0.3:1", nil) // uid-c never has an entry
+	start := time.Now()
+	act, ann := run(t, tr, transform.ModeMITM, r)
+	require.Equal(t, transform.ActionReject, act)
+	require.Equal(t, "svid_unavailable", ann["rejected"])
+	require.Equal(t, 3, f.calls)
+	require.Less(t, time.Since(start), 2*time.Second)
+}
+
+func TestWaitConfigBounds(t *testing.T) {
+	pods, f := setup()
+	base := config{TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/", Routes: []routeConfig{{Audience: "a", Rules: []hostmatch.RuleConfig{{Host: "x"}}}}}
+	for _, w := range []time.Duration{-time.Second, 16 * time.Second} {
+		c := base
+		c.Wait = w
+		_, err := newFromConfig(c, slog.Default(), pods, f)
+		require.Error(t, err, w)
+	}
+	c := base
+	c.Wait = 6 * time.Second
+	tr, err := newFromConfig(c, slog.Default(), pods, f)
+	require.NoError(t, err)
+	require.Equal(t, 6*time.Second, tr.wait)
 }
