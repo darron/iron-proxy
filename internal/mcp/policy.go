@@ -30,6 +30,11 @@ const (
 	ReasonOversizeBody       = "oversize_body"
 	ReasonMalformedJSONRPC   = "malformed_jsonrpc"
 	ReasonBatchNotSupported  = "batch_not_supported"
+	// ReasonAmbiguousKeys: an object in the body has two keys that
+	// encoding/json would treat as the same field (see checkUnambiguousKeys).
+	ReasonAmbiguousKeys = "ambiguous_keys"
+	// ReasonBodyNotAllowed: a non-POST request carried a body.
+	ReasonBodyNotAllowed = "body_not_allowed"
 )
 
 // Decision values recorded on audit messages.

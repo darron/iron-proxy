@@ -24,6 +24,11 @@ var errAmbiguousKeys = errors.New("ambiguous JSON object keys")
 // {"name":"execute","NAME":"search"} is evaluated here as "search" but
 // dispatched upstream as "execute". Rejecting every fold collision anywhere
 // in the document removes the differential for every field the policy reads.
+//
+// Toolchain coupling: foldKey mirrors encoding/json v1 (fold.go, built with
+// !goexperiment.jsonv2). encoding/json/v2 matches names case-sensitively by
+// default; if this package ever moves to v2 or GOEXPERIMENT=jsonv2, re-verify
+// foldKey against the new matching rules (TestFoldKeyMatchesEncodingJSON).
 func checkUnambiguousKeys(body []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()

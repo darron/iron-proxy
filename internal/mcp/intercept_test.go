@@ -330,3 +330,127 @@ func TestWrapResponseBodyOtherContentTypePassesThrough(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "plain text", string(out))
 }
+
+func newExecutorStylePolicy(t *testing.T) *Policy {
+	t.Helper()
+	p, err := Compile(Config{
+		Servers: []ServerConfig{{
+			Name:  "executor",
+			Rules: []hostmatch.RuleConfig{{Host: "mcp.github.com"}},
+			Tools: []ToolConfig{
+				{Name: "search"},
+				{Name: "call", When: []ClauseConfig{{Path: "calls.path", In: []any{"tools.github.get_me"}}}},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	return p
+}
+
+// The original bypass: encoding/json would evaluate "search" while a
+// case-sensitive server dispatches "execute".
+func TestEvaluateRequestAmbiguousKeysDenied(t *testing.T) {
+	p := newExecutorStylePolicy(t)
+	s := p.MatchServer(newJSONRequest(t, "{}"))
+	for name, body := range map[string]string{
+		"name/NAME":           `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute","NAME":"search","arguments":{"code":"1"}}}`,
+		"arguments/Arguments": `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call","arguments":{"calls":{"path":"tools.github.get_tag"}},"Arguments":{"calls":{"path":"tools.github.get_me"}}}}`,
+		"escaped":             `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute","NAME":"search"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tr := &Trace{Server: s.Name}
+			resp, err := p.EvaluateRequest(s, newJSONRequest(t, body), tr)
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			require.Len(t, tr.Messages, 1)
+			require.Equal(t, DecisionDeny, tr.Messages[0].Decision)
+			require.Equal(t, ReasonAmbiguousKeys, tr.Messages[0].Reason)
+		})
+	}
+}
+
+func TestEvaluateRequestAmbiguousKeysInBatchDeniedAsBatch(t *testing.T) {
+	p := newExecutorStylePolicy(t)
+	s := p.MatchServer(newJSONRequest(t, "{}"))
+	body := `[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute","Name":"search"}}]`
+	tr := &Trace{Server: s.Name}
+	resp, err := p.EvaluateRequest(s, newJSONRequest(t, body), tr)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, ReasonAmbiguousKeys, tr.Messages[0].Reason)
+	respBody, _ := io.ReadAll(resp.Body)
+	require.Equal(t, byte('['), bytes.TrimSpace(respBody)[0], "batch request gets a batch-shaped error")
+}
+
+// Intentional over-rejection: a fold collision inside tool arguments is
+// refused even though argument matching is exact (GLM review M2).
+func TestEvaluateRequestAmbiguousKeysInsideArgumentsDenied(t *testing.T) {
+	p := newExecutorStylePolicy(t)
+	s := p.MatchServer(newJSONRequest(t, "{}"))
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"q":1,"Q":2}}}`
+	tr := &Trace{Server: s.Name}
+	resp, err := p.EvaluateRequest(s, newJSONRequest(t, body), tr)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, ReasonAmbiguousKeys, tr.Messages[0].Reason)
+}
+
+func TestEvaluateRequestMalformedEdgesDenied(t *testing.T) {
+	p := newExecutorStylePolicy(t)
+	s := p.MatchServer(newJSONRequest(t, "{}"))
+	deep := strings.Repeat("[", 10001) + strings.Repeat("]", 10001)
+	for name, body := range map[string]string{
+		"BOM":          "\xef\xbb\xbf" + `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
+		"trailing":     `{"jsonrpc":"2.0","id":1,"method":"tools/list"} x`,
+		"concatenated": `{"jsonrpc":"2.0","id":1,"method":"tools/list"}{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute"}}`,
+		// The id is kept raw, so 1e999 there is harmless; inside arguments it
+		// cannot be decoded and the call is refused.
+		"huge number in arguments": `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"call","arguments":{"calls":{"path":"tools.github.get_me","input":1e999}}}}`,
+		"too deep":                 deep,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tr := &Trace{Server: s.Name}
+			resp, err := p.EvaluateRequest(s, newJSONRequest(t, body), tr)
+			require.NoError(t, err)
+			require.NotNil(t, resp, "must deny, not forward")
+			require.Equal(t, DecisionDeny, tr.Messages[0].Decision)
+		})
+	}
+}
+
+func newMethodRequest(t *testing.T, method, body string) *http.Request {
+	t.Helper()
+	r := newJSONRequest(t, body)
+	r.Method = method
+	return r
+}
+
+func TestEvaluateRequestNonPostWithBodyDenied(t *testing.T) {
+	p := newExecutorStylePolicy(t)
+	s := p.MatchServer(newJSONRequest(t, "{}"))
+	for _, method := range []string{http.MethodGet, http.MethodDelete, http.MethodPut} {
+		tr := &Trace{Server: s.Name}
+		resp, err := p.EvaluateRequest(s, newMethodRequest(t, method, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute"}}`), tr)
+		require.NoError(t, err)
+		require.NotNil(t, resp, method)
+		require.Equal(t, ReasonBodyNotAllowed, tr.Messages[0].Reason)
+	}
+}
+
+func TestEvaluateRequestNonPostWithoutBodyPasses(t *testing.T) {
+	p := newExecutorStylePolicy(t)
+	s := p.MatchServer(newJSONRequest(t, "{}"))
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		tr := &Trace{Server: s.Name}
+		resp, err := p.EvaluateRequest(s, newMethodRequest(t, method, ""), tr)
+		require.NoError(t, err)
+		require.Nil(t, resp, method)
+		require.Empty(t, tr.Messages)
+	}
+	// A request without a buffered body at all (e.g. http.NoBody) also passes.
+	r := newMethodRequest(t, http.MethodGet, "")
+	r.Body = http.NoBody
+	resp, err := p.EvaluateRequest(s, r, &Trace{Server: s.Name})
+	require.NoError(t, err)
+	require.Nil(t, resp)
+}
