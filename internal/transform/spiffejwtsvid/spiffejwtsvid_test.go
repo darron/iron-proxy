@@ -602,6 +602,65 @@ func TestRelayedPeerFailsClosed(t *testing.T) {
 	}
 }
 
+func TestAdditionalRelayIdentityIsRouteScoped(t *testing.T) {
+	const microPattern = `^spiffe://test-actor\.local/worker/(isolated(?:-docker)?/[^/?#]+)$`
+	const model = "model.example"
+	const executor = "executor.example"
+	const files = "files.example"
+	const identityBase = "spiffe://test-actor.local/worker/"
+	for _, tc := range []struct {
+		name, peer, host, token, audience string
+	}{
+		{"isolated model", identityBase + "isolated/same-name", model, "micro", "model-router"},
+		{"Docker model", identityBase + "isolated-docker/same-name", model, "docker", "model-router"},
+		{"legacy model", identityBase + "legacy/sample", model, "ax", "model-router"},
+		{"legacy Executor", identityBase + "legacy/sample", executor, "ax", "executor"},
+		{"isolated Executor", identityBase + "isolated/same-name", executor, "", ""},
+		{"isolated files", identityBase + "isolated/same-name", files, "", ""},
+		{"Docker Executor", identityBase + "isolated-docker/same-name", executor, "", ""},
+		{"Docker files", identityBase + "isolated-docker/same-name", files, "", ""},
+		{"other namespace", identityBase + "other/same-name", model, "", ""},
+		{"invalid peer path", identityBase + "isolated/same-name/extra", model, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pods, _ := setup()
+			f := &relayFetcher{bySel: map[string][]SVID{
+				"sbx:worker:sample":                    {svid("spiffe://workload.example/sandbox/ax/a", "ax")},
+				"sbx:worker:isolated/same-name":        {svid("spiffe://workload.example/sandbox/isolated/a", "micro")},
+				"sbx:worker:isolated-docker/same-name": {svid("spiffe://workload.example/sandbox/isolated-docker/a", "docker")},
+			}}
+			tr, err := newFromConfig(config{
+				TrustDomain: "workload.example", IDPrefix: "/sandbox/",
+				Routes: []routeConfig{
+					{Audience: "executor", Rules: []hostmatch.RuleConfig{{Host: executor}}},
+					{Audience: "model-router", Rules: []hostmatch.RuleConfig{{Host: model}}, RelayIDPattern: microPattern},
+					{Audience: "sbx-files", Rules: []hostmatch.RuleConfig{{Host: files}}},
+				},
+				Relay: &relayConfig{
+					IDPattern:    `^spiffe://test-actor\.local/worker/legacy/([^/]+)$`,
+					SelectorType: "sbx", SelectorPrefix: "worker:",
+					Source: relaySourceConfig{Namespaces: []string{"gateway"}, LabelSelector: "app=relay"},
+				},
+			}, slog.Default(), pods, f)
+			require.NoError(t, err)
+			tr.now = func() time.Time { return t0.Add(time.Minute) }
+			tr.relay.source = fakePods{gatewayIP: {Namespace: "gateway", Name: "relay-x", UID: "gw"}}
+			req := request(tc.host, gatewayIP+":1", http.Header{defaultHeader: {"Bearer forged"}})
+			action, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), tc.peer), req)
+			if tc.token == "" {
+				require.Equal(t, transform.ActionReject, action)
+				require.Equal(t, "relay_peer_mismatch", ann["rejected"])
+				require.Empty(t, req.Header.Get(defaultHeader))
+				require.Zero(t, f.calls)
+			} else {
+				require.Equal(t, transform.ActionContinue, action)
+				require.Equal(t, "Bearer "+tc.token, req.Header.Get(defaultHeader))
+				require.Equal(t, tc.audience, f.lastAud)
+			}
+		})
+	}
+}
+
 func TestRelayWithoutConfigNeverFallsBackToSourceIP(t *testing.T) {
 	pods, f := setup()
 	tr := newTestTransform(t, pods, f) // no relay config
