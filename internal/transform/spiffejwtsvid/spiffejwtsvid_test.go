@@ -602,6 +602,65 @@ func TestRelayedPeerFailsClosed(t *testing.T) {
 	}
 }
 
+func TestAdditionalRelayIdentityIsRouteScoped(t *testing.T) {
+	const microPattern = `^spiffe://substrate-actor\.local/worker-for-actor/(ax-microvm(?:-docker)?/[^/?#]+)$`
+	const model = "router.local"
+	const executor = "executor.mcp.local"
+	const files = "sandbox-api-files.sandbox-api.svc.cluster.local"
+	const identityBase = "spiffe://substrate-actor.local/worker-for-actor/"
+	for _, tc := range []struct {
+		name, peer, host, token, audience string
+	}{
+		{"microVM model", identityBase + "ax-microvm/same-name", model, "micro", "model-router"},
+		{"Docker model", identityBase + "ax-microvm-docker/same-name", model, "docker", "model-router"},
+		{"gVisor model", axPeer, model, "ax", "model-router"},
+		{"gVisor Executor", axPeer, executor, "ax", "executor"},
+		{"microVM Executor", identityBase + "ax-microvm/same-name", executor, "", ""},
+		{"microVM files", identityBase + "ax-microvm/same-name", files, "", ""},
+		{"Docker Executor", identityBase + "ax-microvm-docker/same-name", executor, "", ""},
+		{"Docker files", identityBase + "ax-microvm-docker/same-name", files, "", ""},
+		{"other namespace", identityBase + "other/same-name", model, "", ""},
+		{"invalid peer path", identityBase + "ax-microvm/same-name/extra", model, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pods, _ := setup()
+			f := &relayFetcher{bySel: map[string][]SVID{
+				"sbx:ax-actor:sbx-abc123":                  {svid("spiffe://sbx.interval.internal/sandbox/ax/a", "ax")},
+				"sbx:ax-actor:ax-microvm/same-name":        {svid("spiffe://sbx.interval.internal/sandbox/ax-microvm/a", "micro")},
+				"sbx:ax-actor:ax-microvm-docker/same-name": {svid("spiffe://sbx.interval.internal/sandbox/ax-microvm-docker/a", "docker")},
+			}}
+			tr, err := newFromConfig(config{
+				TrustDomain: "sbx.interval.internal", IDPrefix: "/sandbox/",
+				Routes: []routeConfig{
+					{Audience: "executor", Rules: []hostmatch.RuleConfig{{Host: executor}}},
+					{Audience: "model-router", Rules: []hostmatch.RuleConfig{{Host: model}}, RelayIDPattern: microPattern},
+					{Audience: "sbx-files", Rules: []hostmatch.RuleConfig{{Host: files}}},
+				},
+				Relay: &relayConfig{
+					IDPattern:    `^spiffe://substrate-actor\.local/worker-for-actor/ax-lab/([^/]+)$`,
+					SelectorType: "sbx", SelectorPrefix: "ax-actor:",
+					Source: relaySourceConfig{Namespaces: []string{"ate-system"}, LabelSelector: "app=atenet-egress"},
+				},
+			}, slog.Default(), pods, f)
+			require.NoError(t, err)
+			tr.now = func() time.Time { return t0.Add(time.Minute) }
+			tr.relay.source = fakePods{gatewayIP: {Namespace: "ate-system", Name: "atenet-egress-x", UID: "gw"}}
+			req := request(tc.host, gatewayIP+":1", http.Header{defaultHeader: {"Bearer forged"}})
+			action, ann := runCtx(t, tr, transform.WithRelayPeer(context.Background(), tc.peer), req)
+			if tc.token == "" {
+				require.Equal(t, transform.ActionReject, action)
+				require.Equal(t, "relay_peer_mismatch", ann["rejected"])
+				require.Empty(t, req.Header.Get(defaultHeader))
+				require.Zero(t, f.calls)
+			} else {
+				require.Equal(t, transform.ActionContinue, action)
+				require.Equal(t, "Bearer "+tc.token, req.Header.Get(defaultHeader))
+				require.Equal(t, tc.audience, f.lastAud)
+			}
+		})
+	}
+}
+
 func TestRelayWithoutConfigNeverFallsBackToSourceIP(t *testing.T) {
 	pods, f := setup()
 	tr := newTestTransform(t, pods, f) // no relay config

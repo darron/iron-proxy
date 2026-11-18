@@ -96,11 +96,15 @@ type relay struct {
 type routeConfig struct {
 	Audience string                 `yaml:"audience"`
 	Rules    []hostmatch.RuleConfig `yaml:"rules"`
+	// RelayIDPattern admits additional authenticated peers for this route.
+	// Its single capture is appended to the existing relay selector prefix.
+	RelayIDPattern string `yaml:"relay_id_pattern,omitempty"`
 }
 
 type route struct {
 	audience string
 	rules    []hostmatch.Rule
+	relayID  *regexp.Regexp
 }
 
 // Pod is the minimal view of the pod that owns a source IP.
@@ -208,7 +212,18 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 		if len(rules) == 0 {
 			return nil, fmt.Errorf("%s: routes[%d] needs at least one entry in \"rules\"", name, i)
 		}
-		routes = append(routes, route{audience: rc.Audience, rules: rules})
+		var relayID *regexp.Regexp
+		if rc.RelayIDPattern != "" {
+			field := fmt.Sprintf("routes[%d].relay_id_pattern", i)
+			if c.Relay == nil {
+				return nil, fmt.Errorf("%s: %s requires relay configuration", name, field)
+			}
+			relayID, err = compileRelayIDPattern(rc.RelayIDPattern, field)
+			if err != nil {
+				return nil, err
+			}
+		}
+		routes = append(routes, route{audience: rc.Audience, rules: rules, relayID: relayID})
 	}
 	header := http.CanonicalHeaderKey(strings.TrimSpace(c.Header))
 	if header == "" {
@@ -231,15 +246,9 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 	}
 	var rl *relay
 	if c.Relay != nil {
-		if !strings.HasPrefix(c.Relay.IDPattern, "^") || !strings.HasSuffix(c.Relay.IDPattern, "$") {
-			return nil, fmt.Errorf("%s: relay.id_pattern must be anchored with ^ and $", name)
-		}
-		re, err := regexp.Compile(c.Relay.IDPattern)
+		re, err := compileRelayIDPattern(c.Relay.IDPattern, "relay.id_pattern")
 		if err != nil {
-			return nil, fmt.Errorf("%s: relay.id_pattern: %w", name, err)
-		}
-		if re.NumSubexp() != 1 {
-			return nil, fmt.Errorf("%s: relay.id_pattern must capture exactly one group", name)
+			return nil, err
 		}
 		if c.Relay.SelectorType == "" || strings.Contains(c.Relay.SelectorType, ":") {
 			return nil, fmt.Errorf("%s: relay.selector_type is required and must not contain ':'", name)
@@ -263,6 +272,20 @@ func newFromConfig(c config, logger *slog.Logger, pods PodResolver, fetcher SVID
 		logger:      logger,
 		cache:       make(map[cacheKey]SVID),
 	}, nil
+}
+
+func compileRelayIDPattern(pattern, field string) (*regexp.Regexp, error) {
+	if !strings.HasPrefix(pattern, "^") || !strings.HasSuffix(pattern, "$") {
+		return nil, fmt.Errorf("%s: %s must be anchored with ^ and $", name, field)
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %s: %w", name, field, err)
+	}
+	if re.NumSubexp() != 1 {
+		return nil, fmt.Errorf("%s: %s must capture exactly one group", name, field)
+	}
+	return re, nil
 }
 
 func (t *Transform) Name() string { return name }
@@ -293,8 +316,8 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 	if req.Method == http.MethodConnect {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
-	audience, ok := t.audienceFor(req)
-	if !ok {
+	matched := t.routeFor(req)
+	if matched == nil {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 	if tctx.Mode != transform.ModeMITM {
@@ -303,9 +326,10 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 	// A request relayed by a trusted gateway is identified by what that
 	// gateway asserted, never by the source IP (the gateway's own address).
 	if peer, ok := transform.RelayPeer(ctx); ok {
-		return t.relayIdentity(ctx, tctx, req, audience, peer)
+		return t.relayIdentity(ctx, tctx, req, matched, peer)
 	}
 
+	audience := matched.audience
 	ip, err := sourceIP(req.RemoteAddr)
 	if err != nil {
 		return t.unidentified(tctx, "bad_remote_addr")
@@ -336,7 +360,7 @@ func (t *Transform) TransformRequest(ctx context.Context, tctx *transform.Transf
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
 
-func (t *Transform) relayIdentity(ctx context.Context, tctx *transform.TransformContext, req *http.Request, audience, peer string) (*transform.TransformResult, error) {
+func (t *Transform) relayIdentity(ctx context.Context, tctx *transform.TransformContext, req *http.Request, matched *route, peer string) (*transform.TransformResult, error) {
 	if t.relay == nil {
 		return t.unidentified(tctx, "relay_not_configured")
 	}
@@ -355,9 +379,13 @@ func (t *Transform) relayIdentity(ctx context.Context, tctx *transform.Transform
 		return t.unidentified(tctx, "relay_source_untrusted")
 	}
 	m := t.relay.re.FindStringSubmatch(peer)
-	if m == nil || m[1] == "" {
+	if (m == nil || m[0] != peer) && matched.relayID != nil {
+		m = matched.relayID.FindStringSubmatch(peer)
+	}
+	if m == nil || m[0] != peer || m[1] == "" {
 		return t.unidentified(tctx, "relay_peer_mismatch")
 	}
+	audience := matched.audience
 	sel := &types.Selector{Type: t.relay.selectorType, Value: t.relay.selectorPrefix + m[1]}
 	svid, err := t.svidWithWait(ctx, "relay:"+sel.Type+":"+sel.Value, sel, audience)
 	if err != nil {
@@ -401,14 +429,14 @@ func (t *Transform) svidWithWait(ctx context.Context, subject string, sel *types
 	return svid, err
 }
 
-// audienceFor returns the audience of the first route matching req.
-func (t *Transform) audienceFor(req *http.Request) (string, bool) {
-	for _, r := range t.routes {
+func (t *Transform) routeFor(req *http.Request) *route {
+	for i := range t.routes {
+		r := &t.routes[i]
 		if hostmatch.MatchAnyRule(r.rules, req) {
-			return r.audience, true
+			return r
 		}
 	}
-	return "", false
+	return nil
 }
 
 // cacheKey identifies a cached SVID: the workload subject ("pod:<uid>" or
